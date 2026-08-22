@@ -112,6 +112,11 @@ build() {
   git checkout -q "$CUSTOM"
   echo "== building custom branch @ $(git rev-parse --short HEAD) =="
   cargo build --release "$@"
+  # helix looks for its runtime (grammars, queries, themes) next to the binary.
+  # A raw cargo build does NOT ship it there, which breaks syntax highlighting.
+  # Copy the source runtime/ so the binary finds grammars anywhere.
+  cp -R "$REPO_ROOT/runtime" "$REPO_ROOT/target/release/runtime" \
+    && echo "== runtime -> target/release/runtime =="
   git checkout -q master
   echo "binary: $REPO_ROOT/target/release/hx"
 }

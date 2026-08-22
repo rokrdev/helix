@@ -81,3 +81,28 @@ To refresh a squash-merged PR later:
 
 PRs that merge cleanly (like #3958) don't have this problem — they keep proper
 ancestry, so `sync` re-rebases and re-merges them automatically.
+
+## Runtime gotcha (missing syntax highlighting)
+
+A raw `cargo build` does **not** copy the runtime assets (tree-sitter grammars,
+queries, themes) next to the binary. The health check shows it clearly:
+
+    hx --health   # -> "Runtime directory does not exist: target/release/runtime"
+
+Symptoms: code renders as a single color (no highlighting). Fix options:
+- `tools/helix-fork.sh build` now copies `runtime/` to `target/release/runtime`
+  automatically after compiling — use it instead of bare `cargo build`.
+- Or set `export HELIX_RUNTIME="$PWD/runtime"` before running the binary.
+
+On a freshly-cloned machine: clone, `git checkout custom`, `tools/helix-fork.sh build`.
+
+## Inline git blame (#13133) is opt-in
+
+The feature defaults to off (`show = "never"`, `auto-fetch = false`). To see it
+inline, add to `config.toml` (keys are kebab-case):
+
+    [editor.inline-blame]
+    show = "cursor-line"      # or "all-lines", or "never" to disable
+    auto-fetch = true
+
+Manual trigger while editing: `:blame-line` or the `B` key.
