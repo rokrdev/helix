@@ -96,6 +96,20 @@ Symptoms: code renders as a single color (no highlighting). Fix options:
 
 On a freshly-cloned machine: clone, `git checkout custom`, `tools/helix-fork.sh build`.
 
+## Install on a new system (one command)
+
+The repo ships a self-contained bootstrap, `tools/install.sh`, that clones the fork,
+installs Rust if missing, builds, copies the runtime, and symlinks `hx`:
+
+    # on a fresh machine:
+    git clone git@github.com:rokrdev/helix.git
+    cd helix
+    tools/install.sh          # build + install to ~/.local/bin/hx
+
+Idempotent — re-running it pulls upstream updates from origin and rebuilds.
+Env overrides: `HELIX_FORK_REPO`, `HELIX_FORK_BRANCH`, `HELIX_INSTALL_DIR`,
+`HELIX_WORK_DIR`. Ensure `~/.local/bin` precedes any distro `hx` on PATH.
+
 ## Inline git blame (#13133) is opt-in
 
 The feature defaults to off (`show = "never"`, `auto-fetch = false`). To see it
