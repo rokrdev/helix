@@ -58,3 +58,26 @@ To revert to stock Homebrew helix: remove the symlink (`which hx` falls back to
 Branch per PR keeps each change isolated and reviewable. If you'd rather track
 patches as a flat `patches/*.patch` quilt (git-format-patch style) for portability
 into CI or a build pipeline, say the word — it's a thin wrapper over what's here.
+
+## Active patches
+
+| Branch          | Upstream PR                                   | How applied on `custom` |
+|-----------------|-----------------------------------------------|--------------------------|
+| patch/pr-13133  | #13133 Inline git blame                       | squash merge (a6c1c6634) |
+| patch/pr-3958   | #3958 custom names for custom commands        | --no-ff merge (d10f8209c) |
+
+## Caveat: updating a squash-merged PR
+
+#13133 was applied as a **squash**: the feature's net tree is a single commit on
+`custom` (`a6c1c6634`), so the patch branch's original commits are *not* recorded
+as ancestors of `custom`. If upstream updates #13133, `sync`/`add-pr` can't detect
+it's already applied and will try to re-merge from scratch → conflicts.
+
+To refresh a squash-merged PR later:
+1. `git fetch upstream '+refs/pull/13133/head:refs/remotes/upstream/pr-13133'`
+2. Get just the delta since the version you applied (old PR tip `a828b5609`):
+   `git diff a828b5609 refs/remotes/upstream/pr-13133` — review it.
+3. Apply that delta to `custom` (`git apply`, or edit manually), build, commit.
+
+PRs that merge cleanly (like #3958) don't have this problem — they keep proper
+ancestry, so `sync` re-rebases and re-merges them automatically.
