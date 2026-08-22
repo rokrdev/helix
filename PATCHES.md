@@ -47,7 +47,7 @@ See what custom adds vs upstream:
 The built binary is `target/release/hx`. Symlink it onto your PATH ahead of the
 Homebrew one:
 
-    ln -sf ~/src/helix-fork/target/release/hx ~/.local/bin/hx   # if ~/.local/bin is on PATH
+    ln -sf ~/projects/helix/target/release/hx ~/.local/bin/hx   # if ~/.local/bin is on PATH
     # then in a new shell: hx --version  (should show your custom build)
 
 To revert to stock Homebrew helix: remove the symlink (`which hx` falls back to
