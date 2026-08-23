@@ -80,6 +80,11 @@ pub(super) fn register_hooks(handlers: &Handlers) {
     });
     let tx = handlers.blame.clone();
     register_hook!(move |event: &mut EditorConfigDidChange<'_>| {
+        if event.old_config.inline_blame != event.editor.config().inline_blame {
+            // The `format`, `show`, or debounce settings changed, so any cached
+            // inline-blame render state may be stale.
+            crate::ui::editor::reset_inline_blame_state();
+        }
         let has_enabled_inline_blame = !event.old_config.inline_blame.auto_fetch
             && event.editor.config().inline_blame.auto_fetch;
 

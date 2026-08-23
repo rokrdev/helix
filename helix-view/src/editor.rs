@@ -198,6 +198,12 @@ pub struct InlineBlameConfig {
     pub auto_fetch: bool,
     /// How the inline blame should look like and the information it includes
     pub format: String,
+    /// How long to wait (in milliseconds) after the view stops moving before
+    /// rendering the inline blame. This debounces blame rendering while
+    /// scrolling or moving the cursor quickly, so that inline blame is only
+    /// computed once the view has been still for this duration. A value of `0`
+    /// disables the debounce and renders blame on every frame.
+    pub delay_ms: u64,
 }
 
 impl Default for InlineBlameConfig {
@@ -206,6 +212,7 @@ impl Default for InlineBlameConfig {
             show: InlineBlameShow::Never,
             format: "{author}, {time-ago} • {title} • {commit}".to_owned(),
             auto_fetch: false,
+            delay_ms: 100,
         }
     }
 }

@@ -25,17 +25,143 @@ use helix_core::{
 use helix_view::{
     annotations::diagnostics::DiagnosticFilter,
     document::{Mode, SCRATCH_BUFFER_NAME},
-    editor::{CompleteAction, CursorShapeConfig, InlineBlameConfig, InlineBlameShow},
+    editor::{CompleteAction, CursorShapeConfig, InlineBlameShow},
     graphics::{Color, CursorKind, Modifier, Rect, Style},
     input::{KeyEvent, MouseButton, MouseEvent, MouseEventKind},
     keyboard::{KeyCode, KeyModifiers},
-    Document, Editor, Theme, View,
+    Document, DocumentId, Editor, Theme, View, ViewId,
 };
-use std::{mem::take, num::NonZeroUsize, ops, path::PathBuf, rc::Rc};
+use std::{
+    collections::HashMap,
+    mem::take,
+    num::NonZeroUsize,
+    ops,
+    path::PathBuf,
+    rc::Rc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, OnceLock,
+    },
+};
 
 use tui::{buffer::Buffer as Surface, text::Span};
 
 use super::text_decorations::blame::InlineBlame;
+
+/// Per-view state used to debounce inline blame rendering.
+///
+/// While the user is scrolling or moving the cursor quickly we defer
+/// rendering/hiding the inline blame until the view has been still for
+/// `inline-blame.delay-ms`. In `AllLines` mode the expensive per-frame work is
+/// computing the blame string for every visible line, so we cache the computed
+/// lines; in `CursorLine` mode we cache the single cursor-line blame. Holding
+/// the debounce state in a static registry (keyed by [`ViewId`]) lets us
+/// mutate it from the immutable render path.
+struct InlineBlameRenderState {
+    /// The view anchor (first visible line) the state corresponds to. `None`
+    /// while the view is in the debounce window (nothing committed yet).
+    last_anchor: Option<usize>,
+    /// For `CursorLine` mode: the cursor line the cached single-line blame
+    /// corresponds to. Always `None` in `AllLines` mode.
+    last_line: Option<usize>,
+    /// The document the cache corresponds to, to invalidate when switching docs.
+    doc_id: Option<DocumentId>,
+    /// The format string the cache was computed with.
+    format: String,
+    /// The cached formatted blame per document line (`AllLines` mode).
+    cached_lines: Vec<Option<String>>,
+    /// The cached formatted blame for the cursor line (`CursorLine` mode).
+    cached_line: Option<String>,
+    /// When the currently armed debounced redraw is due. `None` when not armed.
+    pending_deadline: Option<tokio::time::Instant>,
+    /// Generation counter used to cancel stale debounced redraw tasks.
+    generation: Arc<AtomicU64>,
+}
+
+impl Default for InlineBlameRenderState {
+    fn default() -> Self {
+        Self {
+            last_anchor: None,
+            last_line: None,
+            doc_id: None,
+            format: String::new(),
+            cached_lines: Vec::new(),
+            cached_line: None,
+            pending_deadline: None,
+            generation: Arc::new(AtomicU64::new(0)),
+        }
+    }
+}
+
+impl InlineBlameRenderState {
+    /// Record a freshly computed set of blame lines (`AllLines` mode) and
+    /// invalidate any pending debounced redraw tasks.
+    fn set_computed(
+        &mut self,
+        anchor: usize,
+        doc_id: DocumentId,
+        format: &str,
+        lines: Vec<Option<String>>,
+    ) {
+        // Bump the generation so any in-flight debounced redraw tasks from the
+        // movement phase do not fire (we already have the result).
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        self.last_anchor = Some(anchor);
+        self.last_line = None;
+        self.doc_id = Some(doc_id);
+        self.format = format.to_owned();
+        self.cached_lines = lines;
+        self.cached_line = None;
+        self.pending_deadline = None;
+    }
+
+    /// Record a freshly computed single-line blame (`CursorLine` mode) and
+    /// invalidate any pending debounced redraw tasks.
+    fn set_computed_line(
+        &mut self,
+        anchor: usize,
+        line: usize,
+        doc_id: DocumentId,
+        format: &str,
+        blame: String,
+    ) {
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        self.last_anchor = Some(anchor);
+        self.last_line = Some(line);
+        self.doc_id = Some(doc_id);
+        self.format = format.to_owned();
+        self.cached_line = Some(blame);
+        self.cached_lines.clear();
+        self.pending_deadline = None;
+    }
+}
+
+fn inline_blame_states(
+) -> &'static Mutex<HashMap<ViewId, InlineBlameRenderState>> {
+    static STATES: OnceLock<Mutex<HashMap<ViewId, InlineBlameRenderState>>> = OnceLock::new();
+    STATES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Drop all cached inline-blame render state. Called when the inline-blame
+/// configuration changes (e.g. `format` or `show`), so stale caches are not
+/// reused with new settings.
+pub(crate) fn reset_inline_blame_state() {
+    if let Ok(mut states) = inline_blame_states().lock() {
+        states.clear();
+    }
+}
+
+/// What inline blame rendering should do for the current frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlameDecision {
+    /// Reuse the cached result (the view is at the same position it was
+    /// computed for).
+    UseCache,
+    /// Recompute blame for the visible lines now.
+    Compute,
+    /// Hide blame this frame and arm a debounced redraw.
+    Debounce,
+}
 
 pub struct EditorView {
     pub keymaps: Keymaps,
@@ -183,7 +309,7 @@ impl EditorView {
         }
 
         Self::render_rulers(editor, doc, view, inner, surface, theme);
-        Self::render_inline_blame(&config.inline_blame, doc, view, &mut decorations, theme);
+        Self::render_inline_blame(editor, doc, view, &mut decorations, theme);
 
         let primary_cursor = doc
             .selection(view.id)
@@ -250,7 +376,7 @@ impl EditorView {
     }
 
     fn render_inline_blame(
-        inline_blame: &InlineBlameConfig,
+        editor: &Editor,
         doc: &Document,
         view: &View,
         decorations: &mut DecorationManager,
@@ -258,6 +384,7 @@ impl EditorView {
     ) {
         const INLINE_BLAME_SCOPE: &str = "ui.virtual.inline-blame";
         let text = doc.text();
+        let inline_blame = &editor.config().inline_blame;
         match inline_blame.show {
             InlineBlameShow::Never => (),
             InlineBlameShow::CursorLine => {
@@ -265,43 +392,218 @@ impl EditorView {
 
                 // do not render inline blame for empty lines to reduce visual noise
                 if text.line(cursor_line_idx) != doc.line_ending.as_str() {
-                    if let Ok(line_blame) =
-                        doc.line_blame(cursor_line_idx as u32, &inline_blame.format)
-                    {
+                    // Also debounced: while the view keeps moving the cursor-line
+                    // blame is hidden, and only once it has been still for
+                    // `delay-ms` do we render (and cache) it. See
+                    // `Self::cursor_line_blame`.
+                    if let Some(blame) = Self::cursor_line_blame(
+                        doc,
+                        view,
+                        cursor_line_idx,
+                        &inline_blame.format,
+                        inline_blame.delay_ms,
+                        tokio::time::Instant::now(),
+                    ) {
                         decorations.add_decoration(InlineBlame::new(
                             theme.get(INLINE_BLAME_SCOPE),
                             text_decorations::blame::LineBlame::OneLine((
                                 cursor_line_idx,
-                                line_blame,
+                                blame,
                             )),
                         ));
                     };
                 }
             }
             InlineBlameShow::AllLines => {
-                let mut blame_lines = vec![None; text.len_lines()];
-
-                let blame_for_all_lines = view.line_range(doc).filter_map(|line_idx| {
-                    // do not render inline blame for empty lines to reduce visual noise
-                    if text.line(line_idx) != doc.line_ending.as_str() {
-                        doc.line_blame(line_idx as u32, &inline_blame.format)
-                            .ok()
-                            .map(|blame| (line_idx, blame))
-                    } else {
-                        None
-                    }
-                });
-
-                for (line_idx, blame) in blame_for_all_lines {
-                    blame_lines[line_idx] = Some(blame);
+                // The expensive per-frame path (computing blame for every visible
+                // line) is debounced: while the view keeps moving we render no
+                // inline blame, and only once it has been still for
+                // `delay-ms` do we compute (and cache) it. See
+                // `Self::all_lines_blame` for details.
+                if let Some(blame_lines) = Self::all_lines_blame(
+                    doc,
+                    view,
+                    &inline_blame.format,
+                    inline_blame.delay_ms,
+                    tokio::time::Instant::now(),
+                ) {
+                    decorations.add_decoration(InlineBlame::new(
+                        theme.get(INLINE_BLAME_SCOPE),
+                        text_decorations::blame::LineBlame::ManyLines(blame_lines),
+                    ));
                 }
-
-                decorations.add_decoration(InlineBlame::new(
-                    theme.get(INLINE_BLAME_SCOPE),
-                    text_decorations::blame::LineBlame::ManyLines(blame_lines),
-                ));
             }
         }
+    }
+
+    /// Compute the inline blame lines for `AllLines` mode, debounced by
+    /// `inline-blame.delay-ms`.
+    ///
+    /// Returns `Some(lines)` to render inline blame for this frame, or `None`
+    /// to hide it (the view is still moving and inside the debounce window).
+    ///
+    /// - If the view is at the same anchor as the cached computation, reuse the
+    ///   cache (cheap — no per-line diff work).
+    /// - If the view moved and `delay-ms` is `0`, compute immediately.
+    /// - If the view moved and inside the window, hide blame and arm a
+    ///   debounced redraw that will recompute once the view has been still.
+    fn all_lines_blame(
+        doc: &Document,
+        view: &View,
+        format: &str,
+        delay: u64,
+        now: tokio::time::Instant,
+    ) -> Option<Vec<Option<String>>> {
+        let anchor = doc.view_offset(view.id).anchor;
+        let doc_id = doc.id();
+
+        let mut states = inline_blame_states().lock().unwrap();
+        let state = states.entry(view.id).or_default();
+
+        match Self::decide_blame(state, anchor, None, doc_id, format, delay, now) {
+            BlameDecision::UseCache => Some(state.cached_lines.clone()),
+            BlameDecision::Compute => {
+                let lines = Self::compute_all_lines_blame(doc, view, format);
+                state.set_computed(anchor, doc_id, format, lines.clone());
+                Some(lines)
+            }
+            BlameDecision::Debounce => {
+                // Still inside the debounce window: hide blame for this frame
+                // and (re)arm a redraw so that once the view has been still for
+                // `delay` we recompute. We bump the generation each time so that
+                // previously armed (stale) redraw tasks are cancelled — only the
+                // newest one fires.
+                Self::arm_debounced_redraw(state);
+                None
+            }
+        }
+    }
+
+    /// Compute the inline blame for the cursor line, debounced by
+    /// `inline-blame.delay-ms`.
+    ///
+    /// Returns `Some(blame)` to render for this frame, or `None` to hide it
+    /// (the view is still moving and inside the debounce window). The cursor
+    /// line is treated as "moved" whenever the *view* scrolled (anchor changed)
+    /// or the cursor line changed, so both scrolling and cursor motion defer the
+    /// render.
+    fn cursor_line_blame(
+        doc: &Document,
+        view: &View,
+        cursor_line: usize,
+        format: &str,
+        delay: u64,
+        now: tokio::time::Instant,
+    ) -> Option<String> {
+        let anchor = doc.view_offset(view.id).anchor;
+        let doc_id = doc.id();
+
+        let mut states = inline_blame_states().lock().unwrap();
+        let state = states.entry(view.id).or_default();
+
+        match Self::decide_blame(state, anchor, Some(cursor_line), doc_id, format, delay, now) {
+            BlameDecision::UseCache => state.cached_line.clone(),
+            BlameDecision::Compute => {
+                let blame = doc.line_blame(cursor_line as u32, format).ok();
+                if let Some(blame) = &blame {
+                    state.set_computed_line(anchor, cursor_line, doc_id, format, blame.clone());
+                }
+                blame
+            }
+            BlameDecision::Debounce => {
+                Self::arm_debounced_redraw(state);
+                None
+            }
+        }
+    }
+
+    /// (Re)arm a background task that requests a redraw once the debounce
+    /// deadline fires, cancelling any previously armed (stale) redraw. Only
+    /// spawns if we're inside a tokio runtime (always the case in the real
+    /// editor); in tests this is skipped.
+    fn arm_debounced_redraw(state: &InlineBlameRenderState) {
+        let deadline = state.pending_deadline.expect("deadline armed before debounce");
+        let gen = state.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let generation = state.generation.clone();
+        if tokio::runtime::Handle::try_current().is_ok() {
+            tokio::spawn(async move {
+                tokio::time::sleep_until(deadline).await;
+                if generation.load(Ordering::SeqCst) == gen {
+                    helix_event::request_redraw();
+                }
+            });
+        }
+    }
+
+    /// Decide, based on the current frame's inputs, what to do with inline
+    /// blame. `line` is the cursor line in `CursorLine` mode and `None` in
+    /// `AllLines` mode. The only side effect is recording the freshly armed
+    /// deadline in the `Debounce` case, which makes it unit-testable.
+    fn decide_blame(
+        state: &mut InlineBlameRenderState,
+        anchor: usize,
+        line: Option<usize>,
+        doc_id: DocumentId,
+        format: &str,
+        delay: u64,
+        now: tokio::time::Instant,
+    ) -> BlameDecision {
+        // The cache belongs to a specific document + format; otherwise the
+        // anchor match would be meaningless and we'd show stale blame.
+        let context_changed = state.doc_id != Some(doc_id) || state.format != format;
+
+        // "Still" means the view hasn't scrolled (anchor) and, in CursorLine
+        // mode, the cursor line hasn't moved.
+        if !context_changed && state.last_anchor == Some(anchor) && state.last_line == line {
+            // Cache hit: reuse the computed lines without recomputing.
+            return BlameDecision::UseCache;
+        }
+
+        if delay == 0 {
+            // Debounce disabled: always compute.
+            return BlameDecision::Compute;
+        }
+
+        // The view stopped moving long enough that the debounced redraw fired.
+        let has_been_still = state.pending_deadline.is_some_and(|d| now >= d);
+        if has_been_still {
+            return BlameDecision::Compute;
+        }
+
+        // Still inside the debounce window: hide blame this frame and (re)arm
+        // a redraw to fire once the view has been still for `delay`.
+        state.doc_id = Some(doc_id);
+        state.format = format.to_owned();
+        state.last_anchor = None;
+        state.last_line = None;
+        state.pending_deadline = Some(now + tokio::time::Duration::from_millis(delay));
+        BlameDecision::Debounce
+    }
+
+    fn compute_all_lines_blame(
+        doc: &Document,
+        view: &View,
+        format: &str,
+    ) -> Vec<Option<String>> {
+        let text = doc.text();
+        let mut blame_lines = vec![None; text.len_lines()];
+
+        let blame_for_all_lines = view.line_range(doc).filter_map(|line_idx| {
+            // do not render inline blame for empty lines to reduce visual noise
+            if text.line(line_idx) != doc.line_ending.as_str() {
+                doc.line_blame(line_idx as u32, format)
+                    .ok()
+                    .map(|blame| (line_idx, blame))
+            } else {
+                None
+            }
+        });
+
+        for (line_idx, blame) in blame_for_all_lines {
+            blame_lines[line_idx] = Some(blame);
+        }
+
+        blame_lines
     }
 
     pub fn render_rulers(
@@ -1817,3 +2119,145 @@ fn canonicalize_key(key: &mut KeyEvent) {
         key.modifiers.remove(KeyModifiers::SHIFT)
     }
 }
+
+#[cfg(test)]
+mod blame_debounce_tests {
+    use super::{BlameDecision, EditorView, InlineBlameRenderState};
+    use helix_view::DocumentId;
+
+    fn ms(ms: u64) -> tokio::time::Duration {
+        tokio::time::Duration::from_millis(ms)
+    }
+
+    /// Mirror what `all_lines_blame` / `cursor_line_blame` do: `decide_blame`
+    /// is pure, so on a `Compute` decision we record the result in the state
+    /// (like the real render path would after computing the blame).
+    fn next(
+        state: &mut InlineBlameRenderState,
+        anchor: usize,
+        line: Option<usize>,
+        doc: DocumentId,
+        format: &str,
+        delay: u64,
+        now: tokio::time::Instant,
+    ) -> BlameDecision {
+        let decision = EditorView::decide_blame(state, anchor, line, doc, format, delay, now);
+        if decision == BlameDecision::Compute {
+            match line {
+                None => state.set_computed(anchor, doc, format, Vec::new()),
+                Some(line) => {
+                    state.set_computed_line(anchor, line, doc, format, String::new())
+                }
+            }
+        }
+        decision
+    }
+
+    #[test]
+    fn debounce_hides_while_moving_then_computes_when_still() {
+        let mut state = InlineBlameRenderState::default();
+        let doc = DocumentId::default();
+        let t0 = tokio::time::Instant::now();
+        let delay = 100;
+
+        // A fresh (moved) view: hide + arm a redraw 100ms out.
+        assert_eq!(next(&mut state, 1, None, doc, "f", delay, t0), BlameDecision::Debounce);
+        assert!(state.pending_deadline.is_some());
+        assert_eq!(state.last_anchor, None);
+
+        // Still moving before the deadline: keeps hiding and re-arms.
+        assert_eq!(
+            next(&mut state, 2, None, doc, "f", delay, t0 + ms(30)),
+            BlameDecision::Debounce
+        );
+        assert_eq!(
+            next(&mut state, 2, None, doc, "f", delay, t0 + ms(90)),
+            BlameDecision::Debounce
+        );
+
+        // The view has been still since t0+90ms; at t0+190ms the re-armed
+        // deadline has passed → compute.
+        assert_eq!(
+            next(&mut state, 2, None, doc, "f", delay, t0 + ms(190)),
+            BlameDecision::Compute
+        );
+        assert_eq!(state.last_anchor, Some(2));
+        assert_eq!(state.pending_deadline, None);
+
+        // Same anchor again: cache hit, no recompute.
+        assert_eq!(
+            next(&mut state, 2, None, doc, "f", delay, t0 + ms(200)),
+            BlameDecision::UseCache
+        );
+    }
+
+    #[test]
+    fn cursor_line_debounces_on_scroll_and_cursor_move() {
+        let mut state = InlineBlameRenderState::default();
+        let doc = DocumentId::default();
+        let t0 = tokio::time::Instant::now();
+        let delay = 100;
+
+        // Fresh view: hide + arm.
+        assert_eq!(
+            next(&mut state, 1, Some(5), doc, "f", delay, t0),
+            BlameDecision::Debounce
+        );
+
+        // Cursor line change (no scroll) inside the window: keeps hiding.
+        assert_eq!(
+            next(&mut state, 1, Some(6), doc, "f", delay, t0 + ms(30)),
+            BlameDecision::Debounce
+        );
+        // Scroll (anchor change) inside the window: keeps hiding.
+        assert_eq!(
+            next(&mut state, 2, Some(6), doc, "f", delay, t0 + ms(60)),
+            BlameDecision::Debounce
+        );
+
+        // Still at the same position past the deadline: compute.
+        assert_eq!(
+            next(&mut state, 2, Some(6), doc, "f", delay, t0 + ms(170)),
+            BlameDecision::Compute
+        );
+        assert_eq!(state.last_anchor, Some(2));
+        assert_eq!(state.last_line, Some(6));
+
+        // Same anchor + cursor line: cache hit, shown immediately.
+        assert_eq!(
+            next(&mut state, 2, Some(6), doc, "f", delay, t0 + ms(180)),
+            BlameDecision::UseCache
+        );
+        // Cursor line changed after the cache is warm: debounce again.
+        assert_eq!(
+            next(&mut state, 2, Some(7), doc, "f", delay, t0 + ms(190)),
+            BlameDecision::Debounce
+        );
+    }
+
+    #[test]
+    fn cache_is_invalidated_when_doc_or_format_changes() {
+        let mut state = InlineBlameRenderState::default();
+        let doc = DocumentId::default();
+        let t = tokio::time::Instant::now();
+        let delay = 0; // compute immediately
+
+        assert_eq!(next(&mut state, 3, None, doc, "f", delay, t), BlameDecision::Compute);
+        // Same anchor + doc + format -> cache hit.
+        assert_eq!(next(&mut state, 3, None, doc, "f", delay, t), BlameDecision::UseCache);
+        // Different format -> must not reuse the stale cache.
+        assert_eq!(next(&mut state, 3, None, doc, "g", delay, t), BlameDecision::Compute);
+    }
+
+    #[test]
+    fn zero_delay_always_recomputes_on_movement() {
+        let mut state = InlineBlameRenderState::default();
+        let doc = DocumentId::default();
+        let t = tokio::time::Instant::now();
+
+        assert_eq!(next(&mut state, 3, None, doc, "f", 0, t), BlameDecision::Compute);
+        // Different anchor -> recompute (delay 0 has no debounce window).
+        assert_eq!(next(&mut state, 4, None, doc, "f", 0, t), BlameDecision::Compute);
+    }
+}
+

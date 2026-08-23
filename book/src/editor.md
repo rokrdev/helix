@@ -191,6 +191,7 @@ Inline blame is virtual text that appears at the end of a line, displaying infor
 | `show` | When to show inline blame | `"never"` |
 | `auto-fetch` | Automatically fetch blame information in the background | `false` |
 | `format` | Inline blame message format | `"{author}, {time-ago} • {title} • {commit}"` |
+| `delay-ms` | How long to wait (ms) after the view stops moving before rendering the inline blame; defers rendering while scrolling or moving the cursor. `0` disables the debounce | `100` |
 
 `show` can be one of the following:
 - `"all-lines"`: Inline blame is on every line.
@@ -202,6 +203,10 @@ With `auto-fetch` set to `false`, blame for the current file is fetched only whe
 When `auto-fetch` is set to `true`, blame for the file is fetched in the background; this will have no effect on performance, but will use a little bit extra resources in the background. Directly requesting the blame with `space + B` will be instant. Inline blame will show as soon as the blame is available when loading new files.
 
 When opening new files, even with `show` set to `"all-lines"` or `"cursor-line"`, the inline blame won't show. It needs to be fetched first in order to become available, which can be triggered manually with `space + B`.
+
+#### `delay-ms`
+
+With `delay-ms` set to a value greater than `0`, the inline blame is deferred while you are scrolling or moving the cursor: it is hidden until the view has been still for the given number of milliseconds, then rendered (and cached). This applies to both `"all-lines"` and `"cursor-line"` modes. A value of `0` disables this debounce and renders the blame on every frame. Set it to a small value (e.g. `250`) for a snappier feel, or a larger one for smoother scrolling.
 
 #### `format`
 
