@@ -68,8 +68,12 @@ struct InlineBlameRenderState {
     doc_id: Option<DocumentId>,
     /// The format string the cache was computed with.
     format: String,
-    /// The cached formatted blame per document line (`AllLines` mode).
-    cached_lines: Vec<Option<String>>,
+    /// The [`Document::version`] the cache was computed at, so an edit
+    /// (content change) invalidates the cache even when the view didn't move.
+    version: Option<i32>,
+    /// The cached formatted blame per document line (`AllLines` mode), held in
+    /// an `Arc` so a cache hit is a cheap ref-counted clone.
+    cached_lines: Arc<Vec<Option<String>>>,
     /// The cached formatted blame for the cursor line (`CursorLine` mode).
     cached_line: Option<String>,
     /// When the currently armed debounced redraw is due. `None` when not armed.
@@ -85,7 +89,8 @@ impl Default for InlineBlameRenderState {
             last_line: None,
             doc_id: None,
             format: String::new(),
-            cached_lines: Vec::new(),
+            version: None,
+            cached_lines: Arc::new(Vec::new()),
             cached_line: None,
             pending_deadline: None,
             generation: Arc::new(AtomicU64::new(0)),
@@ -99,9 +104,10 @@ impl InlineBlameRenderState {
     fn set_computed(
         &mut self,
         anchor: usize,
+        version: i32,
         doc_id: DocumentId,
         format: &str,
-        lines: Vec<Option<String>>,
+        lines: Arc<Vec<Option<String>>>,
     ) {
         // Bump the generation so any in-flight debounced redraw tasks from the
         // movement phase do not fire (we already have the result).
@@ -110,6 +116,7 @@ impl InlineBlameRenderState {
         self.last_line = None;
         self.doc_id = Some(doc_id);
         self.format = format.to_owned();
+        self.version = Some(version);
         self.cached_lines = lines;
         self.cached_line = None;
         self.pending_deadline = None;
@@ -121,6 +128,7 @@ impl InlineBlameRenderState {
         &mut self,
         anchor: usize,
         line: usize,
+        version: i32,
         doc_id: DocumentId,
         format: &str,
         blame: String,
@@ -130,8 +138,9 @@ impl InlineBlameRenderState {
         self.last_line = Some(line);
         self.doc_id = Some(doc_id);
         self.format = format.to_owned();
+        self.version = Some(version);
         self.cached_line = Some(blame);
-        self.cached_lines.clear();
+        self.cached_lines = Arc::new(Vec::new());
         self.pending_deadline = None;
     }
 }
@@ -148,6 +157,16 @@ fn inline_blame_states(
 pub(crate) fn reset_inline_blame_state() {
     if let Ok(mut states) = inline_blame_states().lock() {
         states.clear();
+    }
+}
+
+/// Drop the cached state of views that no longer exist (closed splits), so the
+/// registry cannot grow without bound as views are opened and closed. Keyed by
+/// [`ViewId`], each stale entry would otherwise pin a document-sized
+/// `Vec<Option<String>>` for the lifetime of the process.
+fn prune_dead_view_state(editor: &Editor) {
+    if let Ok(mut states) = inline_blame_states().lock() {
+        states.retain(|view_id, _| editor.tree.contains(*view_id));
     }
 }
 
@@ -383,6 +402,9 @@ impl EditorView {
         theme: &Theme,
     ) {
         const INLINE_BLAME_SCOPE: &str = "ui.virtual.inline-blame";
+        // Cheap once-per-frame bookkeeping: drop cached state for views that
+        // have been closed, so the static registry can't leak entries.
+        prune_dead_view_state(editor);
         let text = doc.text();
         let inline_blame = &editor.config().inline_blame;
         match inline_blame.show {
@@ -453,18 +475,19 @@ impl EditorView {
         format: &str,
         delay: u64,
         now: tokio::time::Instant,
-    ) -> Option<Vec<Option<String>>> {
+    ) -> Option<Arc<Vec<Option<String>>>> {
         let anchor = doc.view_offset(view.id).anchor;
         let doc_id = doc.id();
+        let version = doc.version();
 
         let mut states = inline_blame_states().lock().unwrap();
         let state = states.entry(view.id).or_default();
 
-        match Self::decide_blame(state, anchor, None, doc_id, format, delay, now) {
-            BlameDecision::UseCache => Some(state.cached_lines.clone()),
+        match Self::decide_blame(state, anchor, None, version, doc_id, format, delay, now) {
+            BlameDecision::UseCache => Some(Arc::clone(&state.cached_lines)),
             BlameDecision::Compute => {
-                let lines = Self::compute_all_lines_blame(doc, view, format);
-                state.set_computed(anchor, doc_id, format, lines.clone());
+                let lines = Arc::new(Self::compute_all_lines_blame(doc, view, format));
+                state.set_computed(anchor, version, doc_id, format, Arc::clone(&lines));
                 Some(lines)
             }
             BlameDecision::Debounce => {
@@ -497,16 +520,33 @@ impl EditorView {
     ) -> Option<String> {
         let anchor = doc.view_offset(view.id).anchor;
         let doc_id = doc.id();
+        let version = doc.version();
 
         let mut states = inline_blame_states().lock().unwrap();
         let state = states.entry(view.id).or_default();
 
-        match Self::decide_blame(state, anchor, Some(cursor_line), doc_id, format, delay, now) {
+        match Self::decide_blame(
+            state,
+            anchor,
+            Some(cursor_line),
+            version,
+            doc_id,
+            format,
+            delay,
+            now,
+        ) {
             BlameDecision::UseCache => state.cached_line.clone(),
             BlameDecision::Compute => {
                 let blame = doc.line_blame(cursor_line as u32, format).ok();
                 if let Some(blame) = &blame {
-                    state.set_computed_line(anchor, cursor_line, doc_id, format, blame.clone());
+                    state.set_computed_line(
+                        anchor,
+                        cursor_line,
+                        version,
+                        doc_id,
+                        format,
+                        blame.clone(),
+                    );
                 }
                 blame
             }
@@ -522,7 +562,12 @@ impl EditorView {
     /// spawns if we're inside a tokio runtime (always the case in the real
     /// editor); in tests this is skipped.
     fn arm_debounced_redraw(state: &InlineBlameRenderState) {
-        let deadline = state.pending_deadline.expect("deadline armed before debounce");
+        // `decide_blame` records a deadline before returning `Debounce`, so in
+        // practice this is always `Some`. Use a defensive `.take()`-style check
+        // anyway: a missing deadline must not panic the whole editor.
+        let Some(deadline) = state.pending_deadline else {
+            return;
+        };
         let gen = state.generation.fetch_add(1, Ordering::SeqCst) + 1;
         let generation = state.generation.clone();
         if tokio::runtime::Handle::try_current().is_ok() {
@@ -543,14 +588,18 @@ impl EditorView {
         state: &mut InlineBlameRenderState,
         anchor: usize,
         line: Option<usize>,
+        version: i32,
         doc_id: DocumentId,
         format: &str,
         delay: u64,
         now: tokio::time::Instant,
     ) -> BlameDecision {
-        // The cache belongs to a specific document + format; otherwise the
-        // anchor match would be meaningless and we'd show stale blame.
-        let context_changed = state.doc_id != Some(doc_id) || state.format != format;
+        // The cache belongs to a specific document + format + content version;
+        // otherwise the anchor match would be meaningless and we'd show stale
+        // blame. `version` bumps on every edit, so an edit invalidates the
+        // cache even when the view didn't move.
+        let context_changed =
+            state.doc_id != Some(doc_id) || state.format != format || state.version != Some(version);
 
         // "Still" means the view hasn't scrolled (anchor) and, in CursorLine
         // mode, the cursor line hasn't moved.
@@ -564,6 +613,14 @@ impl EditorView {
             return BlameDecision::Compute;
         }
 
+        // The content changed (an edit) but the view didn't move: refresh
+        // immediately instead of hiding, so typing doesn't make the blame
+        // flicker in and out.
+        if state.last_anchor.is_some() && state.last_anchor == Some(anchor) && state.last_line == line
+        {
+            return BlameDecision::Compute;
+        }
+
         // The view stopped moving long enough that the debounced redraw fired.
         let has_been_still = state.pending_deadline.is_some_and(|d| now >= d);
         if has_been_still {
@@ -574,6 +631,7 @@ impl EditorView {
         // a redraw to fire once the view has been still for `delay`.
         state.doc_id = Some(doc_id);
         state.format = format.to_owned();
+        state.version = Some(version);
         state.last_anchor = None;
         state.last_line = None;
         state.pending_deadline = Some(now + tokio::time::Duration::from_millis(delay));
@@ -2122,6 +2180,8 @@ fn canonicalize_key(key: &mut KeyEvent) {
 
 #[cfg(test)]
 mod blame_debounce_tests {
+    use std::sync::Arc;
+
     use super::{BlameDecision, EditorView, InlineBlameRenderState};
     use helix_view::DocumentId;
 
@@ -2136,17 +2196,19 @@ mod blame_debounce_tests {
         state: &mut InlineBlameRenderState,
         anchor: usize,
         line: Option<usize>,
+        version: i32,
         doc: DocumentId,
         format: &str,
         delay: u64,
         now: tokio::time::Instant,
     ) -> BlameDecision {
-        let decision = EditorView::decide_blame(state, anchor, line, doc, format, delay, now);
+        let decision =
+            EditorView::decide_blame(state, anchor, line, version, doc, format, delay, now);
         if decision == BlameDecision::Compute {
             match line {
-                None => state.set_computed(anchor, doc, format, Vec::new()),
+                None => state.set_computed(anchor, version, doc, format, Arc::new(Vec::new())),
                 Some(line) => {
-                    state.set_computed_line(anchor, line, doc, format, String::new())
+                    state.set_computed_line(anchor, line, version, doc, format, String::new())
                 }
             }
         }
@@ -2161,24 +2223,24 @@ mod blame_debounce_tests {
         let delay = 100;
 
         // A fresh (moved) view: hide + arm a redraw 100ms out.
-        assert_eq!(next(&mut state, 1, None, doc, "f", delay, t0), BlameDecision::Debounce);
+        assert_eq!(next(&mut state, 1, None, 0, doc, "f", delay, t0), BlameDecision::Debounce);
         assert!(state.pending_deadline.is_some());
         assert_eq!(state.last_anchor, None);
 
         // Still moving before the deadline: keeps hiding and re-arms.
         assert_eq!(
-            next(&mut state, 2, None, doc, "f", delay, t0 + ms(30)),
+            next(&mut state, 2, None, 0, doc, "f", delay, t0 + ms(30)),
             BlameDecision::Debounce
         );
         assert_eq!(
-            next(&mut state, 2, None, doc, "f", delay, t0 + ms(90)),
+            next(&mut state, 2, None, 0, doc, "f", delay, t0 + ms(90)),
             BlameDecision::Debounce
         );
 
         // The view has been still since t0+90ms; at t0+190ms the re-armed
         // deadline has passed → compute.
         assert_eq!(
-            next(&mut state, 2, None, doc, "f", delay, t0 + ms(190)),
+            next(&mut state, 2, None, 0, doc, "f", delay, t0 + ms(190)),
             BlameDecision::Compute
         );
         assert_eq!(state.last_anchor, Some(2));
@@ -2186,7 +2248,7 @@ mod blame_debounce_tests {
 
         // Same anchor again: cache hit, no recompute.
         assert_eq!(
-            next(&mut state, 2, None, doc, "f", delay, t0 + ms(200)),
+            next(&mut state, 2, None, 0, doc, "f", delay, t0 + ms(200)),
             BlameDecision::UseCache
         );
     }
@@ -2200,24 +2262,24 @@ mod blame_debounce_tests {
 
         // Fresh view: hide + arm.
         assert_eq!(
-            next(&mut state, 1, Some(5), doc, "f", delay, t0),
+            next(&mut state, 1, Some(5), 0, doc, "f", delay, t0),
             BlameDecision::Debounce
         );
 
         // Cursor line change (no scroll) inside the window: keeps hiding.
         assert_eq!(
-            next(&mut state, 1, Some(6), doc, "f", delay, t0 + ms(30)),
+            next(&mut state, 1, Some(6), 0, doc, "f", delay, t0 + ms(30)),
             BlameDecision::Debounce
         );
         // Scroll (anchor change) inside the window: keeps hiding.
         assert_eq!(
-            next(&mut state, 2, Some(6), doc, "f", delay, t0 + ms(60)),
+            next(&mut state, 2, Some(6), 0, doc, "f", delay, t0 + ms(60)),
             BlameDecision::Debounce
         );
 
         // Still at the same position past the deadline: compute.
         assert_eq!(
-            next(&mut state, 2, Some(6), doc, "f", delay, t0 + ms(170)),
+            next(&mut state, 2, Some(6), 0, doc, "f", delay, t0 + ms(170)),
             BlameDecision::Compute
         );
         assert_eq!(state.last_anchor, Some(2));
@@ -2225,12 +2287,12 @@ mod blame_debounce_tests {
 
         // Same anchor + cursor line: cache hit, shown immediately.
         assert_eq!(
-            next(&mut state, 2, Some(6), doc, "f", delay, t0 + ms(180)),
+            next(&mut state, 2, Some(6), 0, doc, "f", delay, t0 + ms(180)),
             BlameDecision::UseCache
         );
         // Cursor line changed after the cache is warm: debounce again.
         assert_eq!(
-            next(&mut state, 2, Some(7), doc, "f", delay, t0 + ms(190)),
+            next(&mut state, 2, Some(7), 0, doc, "f", delay, t0 + ms(190)),
             BlameDecision::Debounce
         );
     }
@@ -2242,11 +2304,37 @@ mod blame_debounce_tests {
         let t = tokio::time::Instant::now();
         let delay = 0; // compute immediately
 
-        assert_eq!(next(&mut state, 3, None, doc, "f", delay, t), BlameDecision::Compute);
+        assert_eq!(next(&mut state, 3, None, 0, doc, "f", delay, t), BlameDecision::Compute);
         // Same anchor + doc + format -> cache hit.
-        assert_eq!(next(&mut state, 3, None, doc, "f", delay, t), BlameDecision::UseCache);
+        assert_eq!(next(&mut state, 3, None, 0, doc, "f", delay, t), BlameDecision::UseCache);
         // Different format -> must not reuse the stale cache.
-        assert_eq!(next(&mut state, 3, None, doc, "g", delay, t), BlameDecision::Compute);
+        assert_eq!(next(&mut state, 3, None, 0, doc, "g", delay, t), BlameDecision::Compute);
+    }
+
+    #[test]
+    fn edit_refreshes_cache_immediately_without_debounce_flicker() {
+        let mut state = InlineBlameRenderState::default();
+        let doc = DocumentId::default();
+        let t0 = tokio::time::Instant::now();
+
+        // Warm the cache with debounce disabled (compute immediately).
+        assert_eq!(next(&mut state, 2, None, 0, doc, "f", 0, t0), BlameDecision::Compute);
+        assert_eq!(
+            next(&mut state, 2, None, 0, doc, "f", 0, t0 + ms(1)),
+            BlameDecision::UseCache
+        );
+
+        // The document was edited (version bumped) but the view didn't move:
+        // recompute right away rather than hiding behind the debounce window.
+        assert_eq!(
+            next(&mut state, 2, None, 1, doc, "f", 100, t0 + ms(2)),
+            BlameDecision::Compute
+        );
+        // Now the same version caches.
+        assert_eq!(
+            next(&mut state, 2, None, 1, doc, "f", 100, t0 + ms(3)),
+            BlameDecision::UseCache
+        );
     }
 
     #[test]
@@ -2255,9 +2343,9 @@ mod blame_debounce_tests {
         let doc = DocumentId::default();
         let t = tokio::time::Instant::now();
 
-        assert_eq!(next(&mut state, 3, None, doc, "f", 0, t), BlameDecision::Compute);
+        assert_eq!(next(&mut state, 3, None, 0, doc, "f", 0, t), BlameDecision::Compute);
         // Different anchor -> recompute (delay 0 has no debounce window).
-        assert_eq!(next(&mut state, 4, None, doc, "f", 0, t), BlameDecision::Compute);
+        assert_eq!(next(&mut state, 4, None, 0, doc, "f", 0, t), BlameDecision::Compute);
     }
 }
 

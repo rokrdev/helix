@@ -2,6 +2,8 @@ use helix_core::Position;
 
 use helix_view::theme::Style;
 
+use std::sync::Arc;
+
 use crate::ui::document::{LinePos, TextRenderer};
 use crate::ui::text_decorations::Decoration;
 
@@ -10,7 +12,9 @@ pub enum LineBlame {
     // Optimization: Use `Vec<T>` insted of `HashMap<usize, T>`
     // because we know that the amount of lines visible in the viewport X3 cannot be a very large number,
     // most likely up to a few hundred. In the absolute extreme case, maybe 5,000.
-    ManyLines(Vec<Option<String>>),
+    // The `Arc` lets the render path hand out a cheap ref-counted copy of the
+    // cached blame lines instead of deep-cloning them every frame.
+    ManyLines(Arc<Vec<Option<String>>>),
 }
 
 pub struct InlineBlame {
