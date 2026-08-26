@@ -65,6 +65,20 @@ into CI or a build pipeline, say the word — it's a thin wrapper over what's he
 |-----------------|-----------------------------------------------|--------------------------|
 | patch/pr-13133  | #13133 Inline git blame                       | squash merge (a6c1c6634) |
 | patch/pr-3958   | #3958 custom names for custom commands        | --no-ff merge (d10f8209c) |
+| patch/pr-16163  | #16163 terminal block cursor                  | --no-ff merge (60640ef1f) |
+
+The terminal block cursor (#16163) is **opt-in** — `editor.cursor-shape` defaults
+to the software `block` cursor. To use the native terminal block cursor (fixes
+Kitty/Ghostty cursor-trail artifacts), set in `config.toml`:
+
+    [editor.cursor-shape]
+    normal = "terminal-block"
+    insert = "terminal-block"
+    select = "terminal-block"
+
+Added value is `terminal-block` alongside the existing `block`, `bar`,
+`underline`, `hidden`. Note the terminal block cursor is not theme-colored;
+pick a theme whose primary cursor color matches your terminal's cursor color.
 
 ## Caveat: updating a squash-merged PR
 
