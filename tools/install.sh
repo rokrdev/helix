@@ -48,8 +48,12 @@ cargo build --release
 
 # 4. helix looks for its runtime (grammars/themes/queries) next to the binary;
 #    a plain cargo build does NOT ship it. Copy it so highlighting works.
+#    Skip grammar `sources/` (build-only checkouts whose read-only `.git` object
+#    stores bloat the copy and fail on re-run), and clear the destination first
+#    so we don't nest `runtime` inside an already-present copy.
 say "Copying runtime/ -> target/release/runtime"
-cp -R runtime target/release/runtime
+rm -rf target/release/runtime
+rsync -a --exclude '/grammars/sources/' runtime/ target/release/runtime/
 
 # 5. Symlink onto PATH
 mkdir -p "$INSTALL_DIR"

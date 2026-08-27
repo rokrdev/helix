@@ -114,8 +114,14 @@ build() {
   cargo build --release "$@"
   # helix looks for its runtime (grammars, queries, themes) next to the binary.
   # A raw cargo build does NOT ship it there, which breaks syntax highlighting.
-  # Copy the source runtime/ so the binary finds grammars anywhere.
-  cp -R "$REPO_ROOT/runtime" "$REPO_ROOT/target/release/runtime" \
+  # Copy the source runtime/ so the binary finds grammars anywhere. We skip
+  # `grammars/sources/`: those are build-only grammar checkouts whose nested,
+  # read-only `.git` object stores bloat the copy and make a re-run fail with
+  # "Permission denied". `rm -rf` first also stops rsync from nesting `runtime`
+  # inside an already-present destination.
+  rm -rf "$REPO_ROOT/target/release/runtime"
+  rsync -a --exclude '/grammars/sources/' \
+    "$REPO_ROOT/runtime/" "$REPO_ROOT/target/release/runtime/" \
     && echo "== runtime -> target/release/runtime =="
   git checkout -q master
   echo "binary: $REPO_ROOT/target/release/hx"
