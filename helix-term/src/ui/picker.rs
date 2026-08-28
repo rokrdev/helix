@@ -30,6 +30,7 @@ use tui::widgets::Widget;
 
 use std::{
     borrow::Cow,
+    cmp::Ordering,
     collections::HashMap,
     io::Read,
     path::Path,
@@ -79,6 +80,11 @@ impl From<DocumentId> for PathOrId<'_> {
 }
 
 type FileCallback<T> = Box<dyn for<'a> Fn(&'a Editor, &'a T) -> Option<FileLocation<'a>>>;
+
+/// A comparator used to order matched picker items for display, overriding the
+/// fuzzy matcher's score-based ranking. `Ordering::Less` means `a` sorts before
+/// `b`.
+pub type SortFn<T> = Box<dyn Fn(&T, &T) -> Ordering + Send + Sync>;
 
 /// File path and range of lines (used to align and highlight lines)
 pub type FileLocation<'a> = (PathOrId<'a>, Option<(usize, usize)>);
@@ -269,6 +275,12 @@ pub struct Picker<T: 'static + Send + Sync, D: 'static> {
     /// An event handler for syntax highlighting the currently previewed file.
     preview_highlight_handler: Sender<Arc<Path>>,
     dynamic_query_handler: Option<Sender<DynamicQueryChange>>,
+    /// Optional comparator that reorders matched items for display instead of
+    /// the matcher's score-based ranking.
+    sort: Option<SortFn<T>>,
+    /// Cached display order (matched-item positions) produced by `sort`.
+    /// Kept in sync with the current snapshot in `render_picker`.
+    sorted_order: Vec<u32>,
 }
 
 impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
@@ -394,6 +406,8 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             file_fn: None,
             preview_highlight_handler: PreviewHighlightHandler::<T, D>::default().spawn(),
             dynamic_query_handler: None,
+            sort: None,
+            sorted_order: Vec::new(),
         }
     }
 
@@ -455,9 +469,30 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         self
     }
 
+    /// Order matched items with `sort` instead of the matcher's score-based
+    /// ranking. The comparator receives two items and returns whether the first
+    /// should sort before the second.
+    pub fn with_sort(mut self, sort: SortFn<T>) -> Self {
+        self.sort = Some(sort);
+        self
+    }
+
+    /// Number of items shown in the current ordering.
+    fn ordered_len(&self, snapshot: &nucleo::Snapshot<T>) -> u32 {
+        if self.sort.is_some() {
+            self.sorted_order.len() as u32
+        } else {
+            snapshot.matched_item_count()
+        }
+    }
+
     /// Move the cursor by a number of lines, either down (`Forward`) or up (`Backward`)
     pub fn move_by(&mut self, amount: u32, direction: Direction) {
-        let len = self.matcher.snapshot().matched_item_count();
+        let len = if self.sort.is_some() {
+            self.sorted_order.len() as u32
+        } else {
+            self.matcher.snapshot().matched_item_count()
+        };
 
         if len == 0 {
             // No results, can't move.
@@ -491,17 +526,23 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
 
     /// Move the cursor to the last entry
     pub fn to_end(&mut self) {
-        self.cursor = self
-            .matcher
-            .snapshot()
-            .matched_item_count()
-            .saturating_sub(1);
+        let len = if self.sort.is_some() {
+            self.sorted_order.len() as u32
+        } else {
+            self.matcher.snapshot().matched_item_count()
+        };
+        self.cursor = len.saturating_sub(1);
     }
 
     pub fn selection(&self) -> Option<&T> {
+        let pos = if self.sort.is_some() {
+            *self.sorted_order.get(self.cursor as usize)?
+        } else {
+            self.cursor
+        };
         self.matcher
             .snapshot()
-            .get_matched_item(self.cursor)
+            .get_matched_item(pos)
             .map(|item| item.data)
     }
 
@@ -684,9 +725,21 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         let status = self.matcher.tick(10);
         let snapshot = self.matcher.snapshot();
         if status.changed {
+            // Rebuild the custom display order against the new snapshot before
+            // clamping the cursor, so display positions stay valid.
+            if let Some(sort) = &self.sort {
+                let count = snapshot.matched_item_count();
+                let mut order: Vec<u32> = (0..count).collect();
+                order.sort_by(|a, b| {
+                    let a_data = snapshot.get_matched_item(*a).unwrap().data;
+                    let b_data = snapshot.get_matched_item(*b).unwrap().data;
+                    sort(a_data, b_data)
+                });
+                self.sorted_order = order;
+            }
             self.cursor = self
                 .cursor
-                .min(snapshot.matched_item_count().saturating_sub(1))
+                .min(self.ordered_len(&snapshot).saturating_sub(1))
         }
 
         let text_style = cx.editor.theme.get("ui.text");
@@ -749,7 +802,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         let cursor = self.cursor.saturating_sub(offset);
         let end = offset
             .saturating_add(rows)
-            .min(snapshot.matched_item_count());
+            .min(self.ordered_len(&snapshot));
         let mut indices = Vec::new();
         let mut matcher = MATCHER.lock();
         matcher.config = Config::DEFAULT;
@@ -757,7 +810,15 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             matcher.config.set_match_paths()
         }
 
-        let options = snapshot.matched_items(offset..end).map(|item| {
+        // Positions into the snapshot in display order: the identity range when
+        // unordered, or the cached `sorted_order` slice when a comparator is set.
+        let positions: Vec<u32> = match &self.sort {
+            Some(_) => self.sorted_order[offset as usize..end as usize].to_vec(),
+            None => (offset..end).collect(),
+        };
+
+        let options = positions.into_iter().map(|pos| {
+            let item = snapshot.get_matched_item(pos).unwrap();
             let mut widths = self.widths.iter_mut();
             let mut matcher_index = 0;
 

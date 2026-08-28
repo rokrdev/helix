@@ -85,6 +85,7 @@ use std::{
 use std::{
     borrow::Cow,
     path::{Path, PathBuf},
+    time::SystemTime,
 };
 
 use helix_stdx::Url;
@@ -2571,14 +2572,17 @@ fn global_search(cx: &mut Context) {
         line_start: usize,
         /// 0 indexed line end
         line_end: usize,
+        /// File modification time, used to order results by recency.
+        mtime: Option<SystemTime>,
     }
 
     impl FileResult<'_> {
-        fn new(path: &Path, line_start: usize, line_end: usize) -> Self {
+        fn new(path: &Path, line_start: usize, line_end: usize, mtime: Option<SystemTime>) -> Self {
             Self {
                 path: helix_stdx::path::get_relative_path(path.to_path_buf()),
                 line_start,
                 line_end,
+                mtime,
             }
         }
     }
@@ -2590,6 +2594,7 @@ fn global_search(cx: &mut Context) {
     }
 
     let config = cx.editor.config();
+    let sort_recent = config.search.sort_recent;
     let config = GlobalSearchConfig {
         smart_case: config.search.smart_case,
         file_picker_config: config.file_picker.clone(),
@@ -2681,12 +2686,23 @@ fn global_search(cx: &mut Context) {
                             return WalkState::Continue;
                         }
 
+                        // Capture the file's modification time once per file so
+                        // every matching line shares the same recency key.
+                        let mtime = std::fs::metadata(entry.path())
+                            .and_then(|metadata| metadata.modified())
+                            .ok();
+
                         let mut stop = false;
                         let sink = sinks::UTF8(|line_start, line_content| {
                             let line_start = line_start as usize - 1;
                             let line_end = line_start + line_content.lines().count() - 1;
                             stop = injector
-                                .push(FileResult::new(entry.path(), line_start, line_end))
+                                .push(FileResult::new(
+                                    entry.path(),
+                                    line_start,
+                                    line_end,
+                                    mtime,
+                                ))
                                 .is_err();
 
                             Ok(!stop)
@@ -2735,7 +2751,7 @@ fn global_search(cx: &mut Context) {
     let reg = cx.register.unwrap_or('/');
     cx.editor.registers.last_search_register = reg;
 
-    let picker = Picker::new(
+    let mut picker = Picker::new(
         columns,
         1, // contents
         [],
@@ -2787,6 +2803,14 @@ fn global_search(cx: &mut Context) {
     )
     .with_history_register(Some(reg))
     .with_dynamic_query(get_files, Some(275));
+
+    if sort_recent {
+        // Order results by modification time, most recent first. `None` mtimes
+        // (unreadable metadata) sort last.
+        picker = picker.with_sort(Box::new(|a: &FileResult, b: &FileResult| {
+            b.mtime.cmp(&a.mtime)
+        }));
+    }
 
     cx.push_layer(Box::new(overlaid(picker)));
 }

@@ -367,6 +367,7 @@ Search specific options.
 |--|--|---------|
 | `smart-case` | Enable smart case regex searching (case-insensitive unless pattern contains upper case characters) | `true` |
 | `wrap-around`| Whether the search should wrap after depleting the matches | `true` |
+| `sort-recent` | Sort global search results by file modification time, most recent first, overriding fuzzy path-match ranking | `false` |
 
 ### `[editor.whitespace]` Section
 
