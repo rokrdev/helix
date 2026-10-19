@@ -401,7 +401,8 @@ impl CallHierarchyPicker {
         let block = Block::bordered().title(title);
         let text_style = cx.editor.theme.get("ui.text");
         let selected_style = cx.editor.theme.get("ui.text.focus");
-        let items = call_hierarchy_tree_items(&self.entries);
+        let root = helix_stdx::env::current_working_dir();
+        let items = call_hierarchy_tree_items(&self.entries, &root);
         let Ok(tree) = Tree::new(&items) else {
             return;
         };
@@ -537,12 +538,18 @@ impl CallHierarchyPicker {
     }
 }
 
-fn call_hierarchy_tree_items(entries: &[CallHierarchyEntry]) -> Vec<TreeItem<'static, usize>> {
-    entries.iter().map(call_hierarchy_tree_item).collect()
+fn call_hierarchy_tree_items(
+    entries: &[CallHierarchyEntry],
+    root: &Path,
+) -> Vec<TreeItem<'static, usize>> {
+    entries
+        .iter()
+        .map(|entry| call_hierarchy_tree_item(entry, root))
+        .collect()
 }
 
-fn call_hierarchy_tree_item(entry: &CallHierarchyEntry) -> TreeItem<'static, usize> {
-    let text = call_hierarchy_entry_text(entry);
+fn call_hierarchy_tree_item(entry: &CallHierarchyEntry, root: &Path) -> TreeItem<'static, usize> {
+    let text = call_hierarchy_entry_text(entry, root);
     if entry.children.is_empty() {
         if entry.has_children {
             TreeItem::new(entry.id, text, vec![TreeItem::new_leaf(usize::MAX, "")])
@@ -551,22 +558,40 @@ fn call_hierarchy_tree_item(entry: &CallHierarchyEntry) -> TreeItem<'static, usi
             TreeItem::new_leaf(entry.id, text)
         }
     } else {
-        TreeItem::new(entry.id, text, call_hierarchy_tree_items(&entry.children))
-            .expect("call hierarchy identifiers are unique")
+        TreeItem::new(
+            entry.id,
+            text,
+            call_hierarchy_tree_items(&entry.children, root),
+        )
+        .expect("call hierarchy identifiers are unique")
     }
 }
 
-fn call_hierarchy_entry_text(entry: &CallHierarchyEntry) -> String {
+fn call_hierarchy_entry_text(entry: &CallHierarchyEntry, root: &Path) -> String {
     let detail = entry.item.detail.as_deref().unwrap_or_default();
     let preview_line = entry.preview_location.range.start.line + 1;
+    let path = match entry.location.uri.as_path() {
+        Some(path) => call_hierarchy_display_path(path, root)
+            .to_string_lossy()
+            .into_owned(),
+        None => entry.location.uri.to_string(),
+    };
     format!(
         "{:<9} {} {} {}:{}",
         display_symbol_kind(entry.item.kind),
         entry.item.name,
         detail,
-        entry.location.uri,
+        path,
         preview_line,
     )
+}
+
+// Same strip_prefix-on-cwd as goto_impl. Paths outside root stay absolute.
+fn call_hierarchy_display_path<'a>(path: &'a Path, root: &Path) -> &'a Path {
+    match path.strip_prefix(root) {
+        Ok(relative) if !relative.as_os_str().is_empty() => relative,
+        _ => path,
+    }
 }
 
 fn find_call_hierarchy_entry<'a>(
@@ -2162,4 +2187,26 @@ fn compute_inlay_hints_for_view(
     );
 
     Some(callback)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn call_hierarchy_display_path_is_relative_inside_root() {
+        let path = Path::new("/work/proj/src/main/Foo.java");
+        let shown = call_hierarchy_display_path(path, Path::new("/work/proj"));
+        assert_eq!(shown, Path::new("src/main/Foo.java"));
+    }
+
+    #[test]
+    fn call_hierarchy_display_path_keeps_paths_outside_root() {
+        let sibling = Path::new("/work/proj-other/Foo.java");
+        let shown = call_hierarchy_display_path(sibling, Path::new("/work/proj"));
+        assert_eq!(shown, sibling);
+
+        let root = Path::new("/work/proj");
+        assert_eq!(call_hierarchy_display_path(root, root), root);
+    }
 }
