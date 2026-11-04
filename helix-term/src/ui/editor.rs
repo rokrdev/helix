@@ -267,12 +267,23 @@ impl EditorView {
             Self::doc_syntax_highlighter(doc, view_offset.anchor, inner.height, &loader);
         let mut overlays = Vec::new();
 
-        overlays.push(Self::overlay_syntax_highlights(
+        let label_overlay = Self::overlay_syntax_highlights(
             doc,
             view_offset.anchor,
             inner.height,
             &text_annotations,
-        ));
+        );
+        // Dim goes first so syntax and jump labels both patch on top of it.
+        let has_labels = matches!(&label_overlay,
+            OverlayHighlights::Heterogenous { highlights } if !highlights.is_empty());
+        if has_labels {
+            // Exact lookup: the `ui.virtual` fallback would dim for themes that never asked.
+            if let Some(dim) = theme.find_highlight_exact("ui.virtual.jump-dim") {
+                let range = Self::viewport_char_range(doc, view_offset.anchor, inner.height);
+                overlays.push(OverlayHighlights::single(dim, range));
+            }
+        }
+        overlays.push(label_overlay);
 
         if doc
             .language_config()
@@ -734,13 +745,15 @@ impl EditorView {
         height: u16,
         text_annotations: &TextAnnotations,
     ) -> OverlayHighlights {
+        let range = Self::viewport_char_range(doc, anchor, height);
+        text_annotations.collect_overlay_highlights(range)
+    }
+
+    fn viewport_char_range(doc: &Document, anchor: usize, height: u16) -> std::ops::Range<usize> {
         let text = doc.text().slice(..);
         let row = text.char_to_line(anchor.min(text.len_chars()));
-
-        let mut range = Self::viewport_byte_range(text, row, height);
-        range = text.byte_to_char(range.start)..text.byte_to_char(range.end);
-
-        text_annotations.collect_overlay_highlights(range)
+        let range = Self::viewport_byte_range(text, row, height);
+        text.byte_to_char(range.start)..text.byte_to_char(range.end)
     }
 
     pub fn doc_rainbow_highlights(
