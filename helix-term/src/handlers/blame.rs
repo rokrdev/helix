@@ -1,4 +1,4 @@
-use std::{mem, time::Duration};
+use std::{collections::BTreeMap, mem, sync::Arc, time::Duration};
 
 use helix_event::register_hook;
 use helix_vcs::FileBlame;
@@ -7,21 +7,17 @@ use helix_view::{
     handlers::{BlameEvent, Handlers},
     DocumentId,
 };
-use tokio::time::Instant;
+use tokio::{sync::Mutex, time::Instant};
 
 use crate::job;
 
-/// Handles showing Git Blame for a single document
+/// Handles showing Git Blame for documents
 #[derive(Default)]
 pub struct BlameHandler {
-    /// Computed blame for the file. This is in an `Option` because we
-    /// need to be able to `mem::take` it, as we will need an owned instance
-    /// when we only have access to `&mut self`
-    file_blame: Option<anyhow::Result<FileBlame>>,
-    /// Document for which we will update the blame
-    doc_id: DocumentId,
-    /// If `Some`, when blame is obtained for the file, the user will be notified
-    show_blame_for_line_in_statusline: Option<u32>,
+    /// Latest request per document; BTreeMap keeps opening order.
+    pending: BTreeMap<DocumentId, BlameEvent>,
+    /// Serializes batches so an older walk can't overwrite newer blame.
+    batch_lock: Arc<Mutex<()>>,
 }
 
 impl helix_event::AsyncHook for BlameHandler {
@@ -32,25 +28,38 @@ impl helix_event::AsyncHook for BlameHandler {
         event: Self::Event,
         _timeout: Option<tokio::time::Instant>,
     ) -> Option<tokio::time::Instant> {
-        self.doc_id = event.doc_id;
-        self.show_blame_for_line_in_statusline = event.line;
-        self.file_blame = Some(FileBlame::try_new(event.path));
+        self.pending.insert(event.doc_id, event);
         Some(Instant::now() + Duration::from_millis(50))
     }
 
     fn finish_debounce(&mut self) {
-        let doc_id = self.doc_id;
-        let line_blame = self.show_blame_for_line_in_statusline;
-        let result = mem::take(&mut self.file_blame);
-        if let Some(result) = result {
-            tokio::spawn(async move {
+        let pending = mem::take(&mut self.pending);
+        let batch_lock = Arc::clone(&self.batch_lock);
+        tokio::spawn(async move {
+            let _batch = batch_lock.lock().await;
+            // One walk at a time so a burst of opens can't flood the blocking pool.
+            for BlameEvent { path, doc_id, line } in pending.into_values() {
+                let blame_path = path.clone();
+                let result =
+                    match tokio::task::spawn_blocking(move || FileBlame::try_new(blame_path)).await
+                    {
+                        Ok(result) => result,
+                        Err(err) => {
+                            log::error!("blame task for {} failed: {err}", path.display());
+                            continue;
+                        }
+                    };
                 job::dispatch(move |editor, _| {
                     let Some(doc) = editor.document_mut(doc_id) else {
                         return;
                     };
+                    // The document may have been saved under a new path meanwhile.
+                    if doc.path() != Some(&path) {
+                        return;
+                    }
                     doc.file_blame = Some(result);
                     if !editor.config().inline_blame.auto_fetch {
-                        if let Some(line) = line_blame {
+                        if let Some(line) = line {
                             crate::commands::blame_line_impl(editor, doc_id, line);
                         } else {
                             editor.set_status("Blame for this file is now available")
@@ -58,8 +67,8 @@ impl helix_event::AsyncHook for BlameHandler {
                     }
                 })
                 .await;
-            });
-        }
+            }
+        });
     }
 }
 
