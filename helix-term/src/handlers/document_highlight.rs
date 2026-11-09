@@ -1,16 +1,46 @@
+use std::{collections::HashSet, time::Duration};
+
 use helix_core::syntax::config::LanguageServerFeature;
-use helix_event::{cancelable_future, register_hook};
+use helix_event::{cancelable_future, register_hook, send_blocking, AsyncHook};
 use helix_lsp::{lsp, util::lsp_range_to_range, OffsetEncoding};
 use helix_view::{
     events::{
         ConfigDidChange, DocumentDidChange, DocumentDidOpen, LanguageServerExited,
         LanguageServerInitialized, SelectionDidChange,
     },
-    handlers::Handlers,
+    handlers::{lsp::DocumentHighlightEvent, Handlers},
     DocumentId, Editor, ViewId,
 };
+use tokio::time::Instant;
 
 use crate::job;
+
+#[derive(Debug, Default)]
+pub(super) struct Handler {
+    doc_ids: HashSet<(DocumentId, ViewId)>,
+}
+
+impl AsyncHook for Handler {
+    type Event = DocumentHighlightEvent;
+
+    fn handle_event(&mut self, event: Self::Event, _timeout: Option<Instant>) -> Option<Instant> {
+        self.doc_ids.insert((event.document_id, event.view_id));
+        Some(Instant::now() + Duration::from_millis(100))
+    }
+
+    fn finish_debounce(&mut self) {
+        let ids = std::mem::take(&mut self.doc_ids);
+        job::dispatch_blocking(move |editor, _| {
+            for (doc_id, view_id) in ids {
+                // Closed views must not be re-added to the doc's selections.
+                if !editor.tree.contains(view_id) {
+                    continue;
+                }
+                request_document_highlights(editor, doc_id, view_id);
+            }
+        })
+    }
+}
 
 fn request_document_highlights(editor: &mut Editor, doc_id: DocumentId, view_id: ViewId) {
     if !editor.config().lsp.auto_document_highlight {
@@ -126,14 +156,28 @@ fn apply_document_highlights(
     doc.set_document_highlights(view_id, ranges);
 }
 
-pub(super) fn register_hooks(_handlers: &Handlers) {
+pub(super) fn register_hooks(handlers: &Handlers) {
+    let tx = handlers.document_highlight.clone();
     register_hook!(move |event: &mut SelectionDidChange<'_>| {
         if event.doc.config.load().lsp.auto_document_highlight {
-            let doc_id = event.doc.id();
             let view_id = event.view;
-            job::dispatch_blocking(move |editor, _| {
-                request_document_highlights(editor, doc_id, view_id);
-            });
+            // No server means nothing to request, so clear inline instead of queuing a job.
+            if !event
+                .doc
+                .has_language_server_with_feature(LanguageServerFeature::DocumentHighlight)
+            {
+                event.doc.clear_document_highlights(view_id);
+                return Ok(());
+            }
+            // Drop a slow in-flight request so it cannot paint the old position.
+            event.doc.document_highlight_controller(view_id).cancel();
+            send_blocking(
+                &tx,
+                DocumentHighlightEvent {
+                    document_id: event.doc.id(),
+                    view_id,
+                },
+            );
         }
         Ok(())
     });

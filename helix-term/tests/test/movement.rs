@@ -842,3 +842,101 @@ async fn tree_sitter_motions_work_across_injections() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[allow(clippy::single_range_in_vec_init)]
+#[tokio::test(flavor = "multi_thread")]
+async fn document_highlights_cleared_on_move_without_language_server() -> anyhow::Result<()> {
+    let mut config = test_config();
+    config.editor.lsp.auto_document_highlight = true;
+
+    let file = temp_file_with_contents("one two\n")?;
+    let mut app = AppBuilder::new()
+        .with_config(config)
+        .with_file(file.path(), None)
+        .build()?;
+
+    // No event loop: only an inline clear passes, not a queued job or debounce.
+    let (view, doc) = helix_view::current!(app.editor);
+    doc.set_document_highlights(view.id, vec![0..3]);
+    doc.set_selection(view.id, Selection::point(1));
+    assert!(doc.document_highlights(view.id).is_none());
+
+    Ok(())
+}
+
+#[allow(clippy::single_range_in_vec_init)]
+#[tokio::test(flavor = "multi_thread")]
+async fn document_highlight_debounce_skips_closed_view() -> anyhow::Result<()> {
+    let mut config = test_config();
+    config.editor.lsp.auto_document_highlight = true;
+
+    let file = temp_file_with_contents("one two\n")?;
+    let mut app = AppBuilder::new()
+        .with_config(config)
+        .with_file(file.path(), None)
+        .build()?;
+
+    let doc_id = helix_view::doc!(app.editor).id();
+    app.editor
+        .switch(doc_id, helix_view::editor::Action::VerticalSplit);
+    let closed_view = app.editor.tree.focus;
+    app.editor.close(closed_view);
+    let live_view = app.editor.tree.focus;
+
+    // The live view's highlights clear only if the debounce job ran.
+    helix_view::doc_mut!(app.editor, &doc_id).set_document_highlights(live_view, vec![0..3]);
+
+    // Stands in for an event queued before the close; its job runs after it.
+    for view_id in [closed_view, live_view] {
+        helix_event::send_blocking(
+            &app.editor.handlers.document_highlight,
+            helix_view::handlers::lsp::DocumentHighlightEvent {
+                document_id: doc_id,
+                view_id,
+            },
+        );
+    }
+    run_event_loop_until_idle(&mut app).await;
+
+    let doc = helix_view::doc!(app.editor, &doc_id);
+    assert!(doc.document_highlights(live_view).is_none());
+    assert!(!doc.selections().contains_key(&closed_view));
+
+    Ok(())
+}
+
+#[allow(clippy::single_range_in_vec_init)]
+#[tokio::test(flavor = "multi_thread")]
+async fn document_highlight_debounce_requests_for_doc_the_view_left() -> anyhow::Result<()> {
+    let mut config = test_config();
+    config.editor.lsp.auto_document_highlight = true;
+
+    let file = temp_file_with_contents("one two\n")?;
+    let mut app = AppBuilder::new()
+        .with_config(config)
+        .with_file(file.path(), None)
+        .build()?;
+
+    let (view_id, doc_id) = {
+        let (view, doc) = helix_view::current!(app.editor);
+        (view.id, doc.id())
+    };
+    helix_view::doc_mut!(app.editor, &doc_id).set_document_highlights(view_id, vec![0..3]);
+    app.editor.new_file(helix_view::editor::Action::Replace);
+
+    helix_event::send_blocking(
+        &app.editor.handlers.document_highlight,
+        helix_view::handlers::lsp::DocumentHighlightEvent {
+            document_id: doc_id,
+            view_id,
+        },
+    );
+    run_event_loop_until_idle(&mut app).await;
+
+    // Switching back must not show highlights from before the move.
+    assert!(helix_view::doc!(app.editor, &doc_id)
+        .document_highlights(view_id)
+        .is_none());
+
+    Ok(())
+}

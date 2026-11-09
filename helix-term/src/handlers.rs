@@ -36,6 +36,7 @@ pub fn setup(config: Arc<ArcSwap<Config>>) -> Handlers {
     let signature_hints = SignatureHelpHandler::new().spawn();
     let auto_save = AutoSaveHandler::new().spawn();
     let code_action_hint = code_action_hint::Handler::default().spawn();
+    let document_highlight = document_highlight::Handler::default().spawn();
     let document_colors = DocumentColorsHandler::default().spawn();
     let blame = BlameHandler::default().spawn();
     let document_links = DocumentLinksHandler::default().spawn();
@@ -54,6 +55,7 @@ pub fn setup(config: Arc<ArcSwap<Config>>) -> Handlers {
         pull_diagnostics,
         pull_all_documents_diagnostics,
         code_action_hint,
+        document_highlight,
     };
 
     helix_view::handlers::register_hooks(&handlers);
