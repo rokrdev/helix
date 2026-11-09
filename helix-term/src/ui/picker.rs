@@ -97,6 +97,13 @@ pub enum CachedPreview {
     NotFound,
 }
 
+pub(crate) type PreviewCache = HashMap<Arc<Path>, CachedPreview>;
+
+/// Picker content whose preview cache `PreviewHighlightHandler` fills in.
+pub(crate) trait PreviewHost: 'static {
+    fn preview_cache_mut(&mut self) -> &mut PreviewCache;
+}
+
 // We don't store this enum in the cache so as to avoid lifetime constraints
 // from borrowing a document already opened in the editor.
 pub enum Preview<'picker, 'editor> {
@@ -135,13 +142,39 @@ impl Preview<'_, '_> {
     }
 }
 
-#[derive(Default)]
 pub(crate) struct FilePreview {
-    preview_cache: HashMap<Arc<Path>, CachedPreview>,
+    pub(crate) preview_cache: PreviewCache,
     read_buffer: Vec<u8>,
+    preview_highlight_handler: Sender<Arc<Path>>,
+    last_highlight_request: Option<Arc<Path>>,
 }
 
 impl FilePreview {
+    /// `H` is the picker type the highlight handler looks up.
+    pub(crate) fn new<H: PreviewHost>() -> Self {
+        Self {
+            preview_cache: HashMap::new(),
+            read_buffer: Vec::new(),
+            preview_highlight_handler: PreviewHighlightHandler::<H>::default().spawn(),
+            last_highlight_request: None,
+        }
+    }
+
+    // Skip languageless files and repeat requests, since a failed parse would loop redraws.
+    fn request_highlight(&mut self, path: &Path) {
+        let Some((path, CachedPreview::Document(doc))) = self.preview_cache.get_key_value(path)
+        else {
+            return;
+        };
+        if doc.syntax().is_none()
+            && doc.language_config().is_some()
+            && self.last_highlight_request.as_deref() != Some(&**path)
+        {
+            self.last_highlight_request = Some(path.clone());
+            helix_event::send_blocking(&self.preview_highlight_handler, path.clone());
+        }
+    }
+
     /// Render a file preview for a location using the same layout as picker previews.
     pub(crate) fn render(
         &mut self,
@@ -215,6 +248,7 @@ impl FilePreview {
                 }
 
                 if self.preview_cache.contains_key(path) {
+                    self.request_highlight(path);
                     return Some((Preview::Cached(&self.preview_cache[path]), range));
                 }
 
@@ -265,7 +299,7 @@ impl FilePreview {
                             )))?;
                             let loader = editor.syn_loader.load();
                             if let Some(language_config) = doc.detect_language_config(&loader) {
-                                doc.set_language(Some(language_config), &loader);
+                                doc.language = Some(language_config);
                             }
                             Ok(CachedPreview::Document(Box::new(doc)))
                         } else {
@@ -277,6 +311,7 @@ impl FilePreview {
                     })
                     .unwrap_or(CachedPreview::NotFound);
                 self.preview_cache.insert(path.clone(), preview);
+                self.request_highlight(&path);
                 Some((Preview::Cached(&self.preview_cache[&path]), range))
             }
             PathOrId::Id(id) => {
@@ -712,7 +747,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             preview_cache: HashMap::new(),
             read_buffer: Vec::with_capacity(1024),
             file_fn: None,
-            preview_highlight_handler: PreviewHighlightHandler::<T, D>::default().spawn(),
+            preview_highlight_handler: PreviewHighlightHandler::<Self>::default().spawn(),
             dynamic_query_handler: None,
             sort: None,
             sorted_order: Vec::new(),
@@ -1397,6 +1432,12 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
     }
 }
 
+impl<I: 'static + Send + Sync, D: 'static + Send + Sync> PreviewHost for Picker<I, D> {
+    fn preview_cache_mut(&mut self) -> &mut PreviewCache {
+        &mut self.preview_cache
+    }
+}
+
 impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I, D> {
     fn render(&mut self, area: Rect, surface: &mut Surface, cx: &mut Context) {
         // +---------+ +---------+
@@ -1581,3 +1622,68 @@ impl<T: 'static + Send + Sync, D> Drop for Picker<T, D> {
 }
 
 type PickerCallback<T> = Box<dyn Fn(&mut Context, &T, Action)>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arc_swap::ArcSwap;
+    use helix_view::editor::Config as EditorConfig;
+
+    fn cache_document(
+        preview: &mut FilePreview,
+        syn_loader: &Arc<ArcSwap<helix_core::syntax::Loader>>,
+        path: &Path,
+        with_language: bool,
+    ) {
+        let mut doc = Document::from(
+            "fn main() {}".into(),
+            None,
+            Arc::new(ArcSwap::new(Arc::new(EditorConfig::default()))),
+            syn_loader.clone(),
+        );
+        if with_language {
+            let loader = syn_loader.load();
+            let rust = loader.language_for_name("rust".to_string()).unwrap();
+            doc.language = Some(loader.language(rust).config().clone());
+        }
+        preview
+            .preview_cache
+            .insert(path.into(), CachedPreview::Document(Box::new(doc)));
+    }
+
+    fn drain(rx: &mut tokio::sync::mpsc::Receiver<Arc<Path>>) -> Vec<Arc<Path>> {
+        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    }
+
+    #[test]
+    fn highlight_request_is_sent_once_per_path() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let mut preview = FilePreview {
+            preview_cache: HashMap::new(),
+            read_buffer: Vec::new(),
+            preview_highlight_handler: tx,
+            last_highlight_request: None,
+        };
+        let (a, b, plain) = (Path::new("/a.rs"), Path::new("/b.rs"), Path::new("/c.txt"));
+        let loader = Arc::new(ArcSwap::from_pointee(
+            helix_core::config::default_lang_loader(),
+        ));
+        cache_document(&mut preview, &loader, a, true);
+        cache_document(&mut preview, &loader, b, true);
+        cache_document(&mut preview, &loader, plain, false);
+
+        // A failed parse leaves syntax unset, so every render sees the same state.
+        for _ in 0..3 {
+            preview.request_highlight(a);
+        }
+        assert_eq!(drain(&mut rx), [Arc::from(a)]);
+
+        preview.request_highlight(plain);
+        assert!(drain(&mut rx).is_empty());
+
+        // The debounce may have dropped `a` while `b` was selected, so asking again must resend.
+        preview.request_highlight(b);
+        preview.request_highlight(a);
+        assert_eq!(drain(&mut rx), [Arc::from(b), Arc::from(a)]);
+    }
+}

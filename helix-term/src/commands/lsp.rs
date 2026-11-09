@@ -39,7 +39,11 @@ use crate::{
     ctrl,
     job::{Callback, Job},
     key, shift,
-    ui::{self, overlay::overlaid, FileLocation, Picker, Popup, PromptEvent},
+    ui::{
+        self,
+        overlay::{overlaid, Overlay},
+        FileLocation, Picker, Popup, PromptEvent,
+    },
 };
 
 use std::{
@@ -347,27 +351,38 @@ impl CallHierarchyPicker {
             direction,
             entries,
             state,
-            preview: ui::picker::FilePreview::default(),
+            preview: ui::picker::FilePreview::new::<Self>(),
         }
     }
 
-    fn with_state(
+    fn set_children(
+        &mut self,
         direction: CallHierarchyDirection,
-        entries: Vec<CallHierarchyEntry>,
-        opened: HashSet<Vec<usize>>,
-        selected: Vec<usize>,
-    ) -> Self {
-        let mut state = TreeState::default();
-        for identifier in opened {
-            state.open(identifier);
+        item: &lsp::CallHierarchyItem,
+        selected_path: Vec<usize>,
+        children: Vec<CallHierarchyEntry>,
+    ) {
+        // Root ids restart at 0, so a slow response may land on a different picker.
+        if self.direction != direction {
+            return;
         }
-        state.select(selected);
-        Self {
-            direction,
-            entries,
-            state,
-            preview: ui::picker::FilePreview::default(),
+        let Some(entry) = find_call_hierarchy_entry_mut(&mut self.entries, &selected_path) else {
+            return;
+        };
+        if entry.item != *item {
+            return;
         }
+        if children.is_empty() {
+            entry.has_children = false;
+        } else {
+            entry.children = children;
+            self.state.open(selected_path.clone());
+        }
+        // The user may have collapsed an ancestor while the request was in flight.
+        for len in 1..selected_path.len() {
+            self.state.open(selected_path[..len].to_vec());
+        }
+        self.state.select(selected_path);
     }
 
     fn selected_entry(&self) -> Option<&CallHierarchyEntry> {
@@ -453,12 +468,10 @@ impl CallHierarchyPicker {
         let server_id = entry.server_id;
         let next_id = next_call_hierarchy_id(&self.entries);
         let selected_path = selected.clone();
-        let opened = self.state.opened().clone();
-        let mut entries = self.entries.clone();
 
         match direction {
             CallHierarchyDirection::Incoming => {
-                let Some(request) = client.call_hierarchy_incoming(item) else {
+                let Some(request) = client.call_hierarchy_incoming(item.clone()) else {
                     cx.editor
                         .set_error("Language server does not support call hierarchy");
                     return;
@@ -485,9 +498,8 @@ impl CallHierarchyPicker {
                             editor,
                             compositor,
                             direction,
-                            &mut entries,
+                            &item,
                             selected_path,
-                            opened,
                             children,
                         );
                     };
@@ -496,7 +508,7 @@ impl CallHierarchyPicker {
                 });
             }
             CallHierarchyDirection::Outgoing => {
-                let Some(request) = client.call_hierarchy_outgoing(item) else {
+                let Some(request) = client.call_hierarchy_outgoing(item.clone()) else {
                     cx.editor
                         .set_error("Language server does not support call hierarchy");
                     return;
@@ -524,9 +536,8 @@ impl CallHierarchyPicker {
                             editor,
                             compositor,
                             direction,
-                            &mut entries,
+                            &item,
                             selected_path,
-                            opened,
                             children,
                         );
                     };
@@ -639,28 +650,40 @@ fn replace_call_hierarchy_children(
     editor: &mut Editor,
     compositor: &mut Compositor,
     direction: CallHierarchyDirection,
-    entries: &mut [CallHierarchyEntry],
+    item: &lsp::CallHierarchyItem,
     selected_path: Vec<usize>,
-    mut opened: HashSet<Vec<usize>>,
     children: Vec<CallHierarchyEntry>,
 ) {
-    let Some(entry) = find_call_hierarchy_entry_mut(entries, &selected_path) else {
-        return;
-    };
     if children.is_empty() {
         editor.set_status(format!(
             "No {} calls.",
             call_hierarchy_direction_label(direction)
         ));
-        entry.has_children = false;
-    } else {
-        entry.children = children;
-        opened.insert(selected_path.clone());
     }
+    update_call_hierarchy_picker(compositor, direction, item, selected_path, children);
+}
 
-    let picker =
-        CallHierarchyPicker::with_state(direction, entries.to_vec(), opened, selected_path);
-    compositor.replace_or_push(ui::picker::ID, overlaid(picker));
+fn update_call_hierarchy_picker(
+    compositor: &mut Compositor,
+    direction: CallHierarchyDirection,
+    item: &lsp::CallHierarchyItem,
+    selected_path: Vec<usize>,
+    children: Vec<CallHierarchyEntry>,
+) {
+    // Update in place so the preview cache survives the expand.
+    let Some(Overlay {
+        content: picker, ..
+    }) = compositor.find_id::<Overlay<CallHierarchyPicker>>(ui::picker::ID)
+    else {
+        return;
+    };
+    picker.set_children(direction, item, selected_path, children);
+}
+
+impl ui::picker::PreviewHost for CallHierarchyPicker {
+    fn preview_cache_mut(&mut self) -> &mut ui::picker::PreviewCache {
+        &mut self.preview.preview_cache
+    }
 }
 
 impl Component for CallHierarchyPicker {
@@ -2208,5 +2231,136 @@ mod tests {
 
         let root = Path::new("/work/proj");
         assert_eq!(call_hierarchy_display_path(root, root), root);
+    }
+
+    fn test_entry(id: usize) -> CallHierarchyEntry {
+        let range = lsp::Range::default();
+        let item = lsp::CallHierarchyItem {
+            name: format!("f{id}"),
+            kind: lsp::SymbolKind::FUNCTION,
+            tags: None,
+            detail: None,
+            uri: lsp::Url::parse("file:///work/proj/Foo.java").unwrap(),
+            range,
+            selection_range: range,
+            data: None,
+        };
+        let location = Location {
+            uri: Uri::from(Path::new("/work/proj/Foo.java")),
+            range,
+            offset_encoding: OffsetEncoding::Utf8,
+        };
+        CallHierarchyEntry::new(
+            id,
+            item,
+            location.clone(),
+            location,
+            LanguageServerId::default(),
+        )
+    }
+
+    fn test_compositor() -> Compositor {
+        let picker = CallHierarchyPicker::new(
+            CallHierarchyDirection::Incoming,
+            vec![test_entry(0), test_entry(1)],
+        );
+        let mut compositor = Compositor::new(helix_view::graphics::Rect::default());
+        compositor.push(Box::new(overlaid(picker)));
+        compositor
+    }
+
+    fn compositor_picker(compositor: &mut Compositor) -> &mut CallHierarchyPicker {
+        &mut compositor
+            .find_id::<Overlay<CallHierarchyPicker>>(ui::picker::ID)
+            .unwrap()
+            .content
+    }
+
+    #[test]
+    fn expanding_keeps_preview_cache_and_selects_parent() {
+        let mut compositor = test_compositor();
+        let cached: std::sync::Arc<Path> = Path::new("/work/proj/Foo.java").into();
+        compositor_picker(&mut compositor)
+            .preview
+            .preview_cache
+            .insert(cached.clone(), ui::picker::CachedPreview::NotFound);
+
+        update_call_hierarchy_picker(
+            &mut compositor,
+            CallHierarchyDirection::Incoming,
+            &test_entry(1).item,
+            vec![1],
+            vec![test_entry(2)],
+        );
+
+        let picker = compositor_picker(&mut compositor);
+        assert!(picker.preview.preview_cache.contains_key(&cached));
+        assert_eq!(picker.state.selected(), [1]);
+        assert!(picker.state.opened().contains(&vec![1]));
+        assert_eq!(picker.entries[1].children.len(), 1);
+        assert_eq!(picker.selected_entry().map(|entry| entry.id), Some(1));
+    }
+
+    #[test]
+    fn expanding_with_no_calls_marks_entry_as_leaf() {
+        let mut compositor = test_compositor();
+
+        update_call_hierarchy_picker(
+            &mut compositor,
+            CallHierarchyDirection::Incoming,
+            &test_entry(0).item,
+            vec![0],
+            Vec::new(),
+        );
+
+        let picker = compositor_picker(&mut compositor);
+        assert!(!picker.entries[0].has_children);
+        assert!(picker.state.opened().is_empty());
+        assert_eq!(picker.state.selected(), [0]);
+    }
+
+    #[test]
+    fn expanding_reopens_ancestors_closed_while_request_was_in_flight() {
+        let mut picker = CallHierarchyPicker::new(
+            CallHierarchyDirection::Incoming,
+            vec![test_entry(0), test_entry(1)],
+        );
+        picker.entries[0].children = vec![test_entry(2)];
+        picker.state.open(vec![0]);
+        picker.state.close(&[0]);
+
+        picker.set_children(
+            CallHierarchyDirection::Incoming,
+            &test_entry(2).item,
+            vec![0, 2],
+            vec![test_entry(3)],
+        );
+
+        assert!(picker.state.opened().contains(&vec![0]));
+        assert!(picker.state.opened().contains(&vec![0, 2]));
+        assert_eq!(picker.state.selected(), [0, 2]);
+    }
+
+    #[test]
+    fn stale_expand_response_is_ignored() {
+        let mut picker = CallHierarchyPicker::new(
+            CallHierarchyDirection::Incoming,
+            vec![test_entry(0), test_entry(1)],
+        );
+        let entries_before = format!("{:?}", picker.entries);
+        let stale = [
+            (CallHierarchyDirection::Outgoing, test_entry(1).item),
+            (CallHierarchyDirection::Incoming, test_entry(5).item),
+        ];
+
+        for (direction, item) in &stale {
+            for children in [vec![test_entry(2)], Vec::new()] {
+                picker.set_children(*direction, item, vec![1], children);
+            }
+        }
+
+        assert_eq!(format!("{:?}", picker.entries), entries_before);
+        assert!(picker.state.opened().is_empty());
+        assert_eq!(picker.state.selected(), [0]);
     }
 }

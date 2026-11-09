@@ -9,14 +9,15 @@ use tokio::time::Instant;
 
 use crate::{job, ui::overlay::Overlay};
 
-use super::{CachedPreview, DynQueryCallback, Picker};
+use super::{CachedPreview, DynQueryCallback, Picker, PreviewHost};
 
-pub(super) struct PreviewHighlightHandler<T: 'static + Send + Sync, D: 'static + Send + Sync> {
+pub(super) struct PreviewHighlightHandler<H: PreviewHost> {
     trigger: Option<Arc<Path>>,
-    phantom_data: std::marker::PhantomData<(T, D)>,
+    // `fn() -> H` keeps the handler Send + Sync even when `H` is not.
+    phantom_data: std::marker::PhantomData<fn() -> H>,
 }
 
-impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Default for PreviewHighlightHandler<T, D> {
+impl<H: PreviewHost> Default for PreviewHighlightHandler<H> {
     fn default() -> Self {
         Self {
             trigger: None,
@@ -25,9 +26,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Default for PreviewHigh
     }
 }
 
-impl<T: 'static + Send + Sync, D: 'static + Send + Sync> AsyncHook
-    for PreviewHighlightHandler<T, D>
-{
+impl<H: PreviewHost> AsyncHook for PreviewHighlightHandler<H> {
     type Event = Arc<Path>;
 
     fn handle_event(
@@ -56,12 +55,13 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> AsyncHook
         job::dispatch_blocking(move |editor, compositor| {
             let Some(Overlay {
                 content: picker, ..
-            }) = compositor.find::<Overlay<Picker<T, D>>>()
+            }) = compositor.find::<Overlay<H>>()
             else {
                 return;
             };
 
-            let Some(CachedPreview::Document(ref mut doc)) = picker.preview_cache.get_mut(&path)
+            let Some(CachedPreview::Document(ref mut doc)) =
+                picker.preview_cache_mut().get_mut(&path)
             else {
                 return;
             };
@@ -89,13 +89,13 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> AsyncHook
                 job::dispatch_blocking(move |editor, compositor| {
                     let Some(Overlay {
                         content: picker, ..
-                    }) = compositor.find::<Overlay<Picker<T, D>>>()
+                    }) = compositor.find::<Overlay<H>>()
                     else {
                         log::info!("picker closed before syntax highlighting finished");
                         return;
                     };
                     let Some(CachedPreview::Document(ref mut doc)) =
-                        picker.preview_cache.get_mut(&path)
+                        picker.preview_cache_mut().get_mut(&path)
                     else {
                         return;
                     };
