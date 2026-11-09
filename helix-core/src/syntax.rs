@@ -6,7 +6,10 @@ use std::{
     fmt, iter,
     ops::{self, RangeBounds},
     path::Path,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 
@@ -513,14 +516,28 @@ impl FileTypeGlobMatcher {
 #[derive(Debug)]
 pub struct Syntax {
     inner: tree_house::Syntax,
+    generation: u64,
 }
 
 const PARSE_TIMEOUT: Duration = Duration::from_millis(500); // half a second is pretty generous
 
+fn next_syntax_generation() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 impl Syntax {
     pub fn new(source: RopeSlice, language: Language, loader: &Loader) -> Result<Self, Error> {
         let inner = tree_house::Syntax::new(source, language, PARSE_TIMEOUT, loader)?;
-        Ok(Self { inner })
+        Ok(Self {
+            inner,
+            generation: next_syntax_generation(),
+        })
+    }
+
+    /// Globally unique, and bumped when the tree changes, so a replaced syntax never matches.
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     pub fn update(
@@ -534,6 +551,7 @@ impl Syntax {
         if edits.is_empty() {
             Ok(())
         } else {
+            self.generation = next_syntax_generation();
             self.inner.update(source, PARSE_TIMEOUT, &edits, loader)
         }
     }
@@ -781,7 +799,7 @@ fn generate_edits(old_text: RopeSlice, changeset: &ChangeSet) -> Vec<InputEdit> 
 /// A set of "overlay" highlights and ranges they apply to.
 ///
 /// As overlays, the styles for the given `Highlight`s are merged on top of the syntax highlights.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum OverlayHighlights {
     /// All highlights use a single `Highlight`.
     ///

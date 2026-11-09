@@ -261,3 +261,31 @@ async fn test_reload_all_with_split_jumplist() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+// No-panic smoke test of the cached rainbow path; it does not check rendered colors.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_rainbow_brackets_render_across_edits_and_view_close() -> anyhow::Result<()> {
+    let file = tempfile::Builder::new().suffix(".rs").tempfile()?;
+    let mut config = helpers::test_config();
+    config.editor.rainbow_brackets = true;
+
+    let mut app = helpers::AppBuilder::new()
+        .with_file(file.path(), None)
+        .with_config(config)
+        .with_input_text("#[f|]#n main() { let x = (1, [2]); }\n")
+        .build()?;
+
+    test_key_sequence(
+        &mut app,
+        // Edit in two views of one doc, move the cursor, then close one view.
+        Some("<C-w>sjo{(<esc>kx<C-w>w2jd<C-w>q"),
+        Some(&|app| {
+            helpers::assert_status_not_error(&app.editor);
+            assert_eq!(1, app.editor.tree.views().count());
+        }),
+        false,
+    )
+    .await?;
+
+    Ok(())
+}

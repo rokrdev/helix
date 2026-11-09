@@ -29,6 +29,7 @@ use helix_view::{
     graphics::{Color, CursorKind, Modifier, Rect, Style},
     input::{KeyEvent, MouseButton, MouseEvent, MouseEventKind},
     keyboard::{KeyCode, KeyModifiers},
+    tree::Tree,
     Document, DocumentId, Editor, Theme, View, ViewId,
 };
 use std::{
@@ -40,7 +41,7 @@ use std::{
     rc::Rc,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, Mutex, OnceLock,
+        Arc, Mutex, OnceLock, Weak,
     },
 };
 
@@ -182,6 +183,80 @@ enum BlameDecision {
     Debounce,
 }
 
+/// The rainbow overlay of one view plus every input it was computed from.
+struct RainbowCacheEntry {
+    // doc_id and doc_version are a cheap safety net beside syntax_generation.
+    doc_id: DocumentId,
+    doc_version: i32,
+    syntax_generation: u64,
+    /// Visible byte range; the query start is derived from it and the tree.
+    viewport: ops::Range<usize>,
+    /// The highlight ids are `depth % rainbow_length`, so this is all the theme contributes.
+    rainbow_length: usize,
+    /// A `Weak` pins the allocation, so a freed loader's address can't match a new one.
+    loader: Weak<syntax::Loader>,
+    overlay: OverlayHighlights,
+}
+
+/// Memoizes rainbow overlays per view so cursor-only frames skip the tree-sitter query.
+#[derive(Default)]
+struct RainbowCache {
+    entries: HashMap<ViewId, RainbowCacheEntry>,
+}
+
+impl RainbowCache {
+    fn retain_views(&mut self, tree: &Tree) {
+        self.entries.retain(|view_id, _| tree.contains(*view_id));
+    }
+
+    fn highlights(
+        &mut self,
+        doc: &Document,
+        view_id: ViewId,
+        anchor: usize,
+        height: u16,
+        theme: &Theme,
+        loader: &Arc<syntax::Loader>,
+    ) -> Option<OverlayHighlights> {
+        let Some(syntax) = doc.syntax() else {
+            // Frees the overlay when a parse timeout or language reset drops the syntax.
+            self.entries.remove(&view_id);
+            return None;
+        };
+        let text = doc.text().slice(..);
+        let row = text.char_to_line(anchor.min(text.len_chars()));
+        let viewport = EditorView::viewport_byte_range(text, row, height);
+        let rainbow_length = theme.rainbow_length();
+
+        if let Some(entry) = self.entries.get(&view_id) {
+            if entry.doc_id == doc.id()
+                && entry.doc_version == doc.version()
+                && entry.syntax_generation == syntax.generation()
+                && entry.viewport == viewport
+                && entry.rainbow_length == rainbow_length
+                && std::ptr::eq(entry.loader.as_ptr(), Arc::as_ptr(loader))
+            {
+                return Some(entry.overlay.clone());
+            }
+        }
+
+        let overlay = EditorView::rainbow_overlay(syntax, text, viewport.clone(), theme, loader);
+        self.entries.insert(
+            view_id,
+            RainbowCacheEntry {
+                doc_id: doc.id(),
+                doc_version: doc.version(),
+                syntax_generation: syntax.generation(),
+                viewport,
+                rainbow_length,
+                loader: Arc::downgrade(loader),
+                overlay: overlay.clone(),
+            },
+        );
+        Some(overlay)
+    }
+}
+
 pub struct EditorView {
     pub keymaps: Keymaps,
     on_next_key: Option<(OnKeyCallback, OnKeyCallbackKind)>,
@@ -191,6 +266,7 @@ pub struct EditorView {
     spinners: ProgressSpinners,
     /// Tracks if the terminal window is focused by reaction to terminal focus events
     terminal_focused: bool,
+    rainbow_cache: RainbowCache,
 }
 
 #[derive(Debug, Clone)]
@@ -214,6 +290,7 @@ impl EditorView {
             completion: None,
             spinners: ProgressSpinners::default(),
             terminal_focused: true,
+            rainbow_cache: RainbowCache::default(),
         }
     }
 
@@ -222,7 +299,7 @@ impl EditorView {
     }
 
     pub fn render_view(
-        &self,
+        &mut self,
         editor: &Editor,
         doc: &Document,
         view: &View,
@@ -290,11 +367,18 @@ impl EditorView {
             .and_then(|config| config.rainbow_brackets)
             .unwrap_or(config.rainbow_brackets)
         {
-            if let Some(overlay) =
-                Self::doc_rainbow_highlights(doc, view_offset.anchor, inner.height, theme, &loader)
-            {
+            if let Some(overlay) = self.rainbow_cache.highlights(
+                doc,
+                view.id,
+                view_offset.anchor,
+                inner.height,
+                theme,
+                &loader,
+            ) {
                 overlays.push(overlay);
             }
+        } else {
+            self.rainbow_cache.entries.remove(&view.id);
         }
 
         if let Some(overlay) = Self::doc_document_link_highlights(doc, theme) {
@@ -767,6 +851,23 @@ impl EditorView {
         let text = doc.text().slice(..);
         let row = text.char_to_line(anchor.min(text.len_chars()));
         let visible_range = Self::viewport_byte_range(text, row, height);
+
+        Some(Self::rainbow_overlay(
+            syntax,
+            text,
+            visible_range,
+            theme,
+            loader,
+        ))
+    }
+
+    fn rainbow_overlay(
+        syntax: &syntax::Syntax,
+        text: helix_core::RopeSlice,
+        visible_range: ops::Range<usize>,
+        theme: &Theme,
+        loader: &syntax::Loader,
+    ) -> OverlayHighlights {
         let start = syntax::child_for_byte_range(
             &syntax.tree().root_node(),
             visible_range.start as u32..visible_range.end as u32,
@@ -774,7 +875,7 @@ impl EditorView {
         .map_or(visible_range.start as u32, |node| node.start_byte());
         let range = start..visible_range.end as u32;
 
-        Some(syntax.rainbow_highlights(text, theme.rainbow_length(), loader, range))
+        syntax.rainbow_highlights(text, theme.rainbow_length(), loader, range)
     }
 
     /// Get highlight spans for document diagnostics
@@ -2073,6 +2174,8 @@ impl Component for EditorView {
             Self::render_bufferline(cx.editor, area.with_height(1), surface);
         }
 
+        self.rainbow_cache.retain_views(&cx.editor.tree);
+
         for (view, is_focused) in cx.editor.tree.views() {
             let doc = cx.editor.document(view.doc).unwrap();
             self.render_view(cx.editor, doc, view, area, surface, is_focused);
@@ -2352,3 +2455,246 @@ mod blame_debounce_tests {
     }
 }
 
+#[cfg(test)]
+mod rainbow_cache_tests {
+    use super::{EditorView, RainbowCache};
+    use arc_swap::ArcSwap;
+    use helix_core::{
+        config::default_lang_loader,
+        syntax::{self, OverlayHighlights},
+        Rope, Selection, Transaction,
+    };
+    use helix_view::{
+        editor::{Config, GutterConfig},
+        graphics::Rect,
+        tree::Tree,
+        Document, DocumentId, Theme, View, ViewId,
+    };
+    use std::sync::Arc;
+
+    const HEIGHT: u16 = 10;
+
+    fn source() -> String {
+        let mut source = String::from("impl Foo {\n");
+        for i in 0..200 {
+            source.push_str(&format!(
+                "    fn f{i}(a: (u32, [u8; 4])) -> Vec<(u32, u32)> {{ vec![(a.0, {i}), (1, 2)] }}\n"
+            ));
+        }
+        source.push_str("}\n");
+        source
+    }
+
+    fn loader() -> Arc<syntax::Loader> {
+        Arc::new(default_lang_loader())
+    }
+
+    fn rust_doc(loader: &Arc<syntax::Loader>) -> Document {
+        let mut doc = Document::from(
+            Rope::from(source()),
+            None,
+            Arc::new(ArcSwap::new(Arc::new(Config::default()))),
+            Arc::new(ArcSwap::new(loader.clone())),
+        );
+        doc.set_language_by_language_id("rust", loader).unwrap();
+        doc
+    }
+
+    fn theme(toml: &str) -> Theme {
+        toml::from_str(toml).unwrap()
+    }
+
+    fn line_anchor(doc: &Document, line: usize) -> usize {
+        doc.text().line_to_char(line)
+    }
+
+    fn empty_overlay() -> OverlayHighlights {
+        OverlayHighlights::Heterogenous {
+            highlights: Vec::new(),
+        }
+    }
+
+    /// Replaces the cached overlay so a later cache hit is distinguishable from a recompute.
+    fn poison(cache: &mut RainbowCache, view: ViewId) -> OverlayHighlights {
+        let sentinel = empty_overlay();
+        cache.entries.get_mut(&view).unwrap().overlay = sentinel.clone();
+        sentinel
+    }
+
+    fn uncached(
+        doc: &Document,
+        anchor: usize,
+        height: u16,
+        theme: &Theme,
+        loader: &Arc<syntax::Loader>,
+    ) -> OverlayHighlights {
+        EditorView::doc_rainbow_highlights(doc, anchor, height, theme, loader).unwrap()
+    }
+
+    #[test]
+    fn hit_matches_uncached_and_ignores_cursor() {
+        let loader = loader();
+        let theme = theme("");
+        let mut doc = rust_doc(&loader);
+        let view = ViewId::default();
+        let anchor = line_anchor(&doc, 100);
+        let mut cache = RainbowCache::default();
+
+        let expected = uncached(&doc, anchor, HEIGHT, &theme, &loader);
+        assert_ne!(
+            expected,
+            empty_overlay(),
+            "test source must produce rainbow highlights"
+        );
+
+        let miss = cache.highlights(&doc, view, anchor, HEIGHT, &theme, &loader);
+        assert_eq!(miss, Some(expected));
+
+        let sentinel = poison(&mut cache, view);
+        doc.set_selection(view, Selection::single(5, 6));
+        let hit = cache.highlights(&doc, view, anchor, HEIGHT, &theme, &loader);
+        assert_eq!(
+            hit,
+            Some(sentinel),
+            "a cursor-only change must reuse the cache"
+        );
+    }
+
+    #[test]
+    fn edit_invalidates() {
+        let loader = loader();
+        let theme = theme("");
+        let mut doc = rust_doc(&loader);
+        let view = ViewId::default();
+        let anchor = line_anchor(&doc, 100);
+        let mut cache = RainbowCache::default();
+        cache.highlights(&doc, view, anchor, HEIGHT, &theme, &loader);
+        let sentinel = poison(&mut cache, view);
+
+        doc.ensure_view_init(view);
+        // Same-length swap keeps the viewport, so version or generation must invalidate.
+        let pos = anchor + 10;
+        assert_eq!(doc.text().char(pos), '(');
+        let txn = Transaction::change(doc.text(), [(pos, pos + 1, Some("[".into()))].into_iter());
+        doc.apply(&txn, view);
+
+        let after = cache
+            .highlights(&doc, view, anchor, HEIGHT, &theme, &loader)
+            .unwrap();
+        assert_ne!(after, sentinel);
+        assert_eq!(after, uncached(&doc, anchor, HEIGHT, &theme, &loader));
+    }
+
+    #[test]
+    fn scroll_and_resize_invalidate() {
+        let loader = loader();
+        let theme = theme("");
+        let doc = rust_doc(&loader);
+        let view = ViewId::default();
+        let anchor = line_anchor(&doc, 100);
+        let mut cache = RainbowCache::default();
+        cache.highlights(&doc, view, anchor, HEIGHT, &theme, &loader);
+
+        let sentinel = poison(&mut cache, view);
+        let scrolled = line_anchor(&doc, 120);
+        let after = cache
+            .highlights(&doc, view, scrolled, HEIGHT, &theme, &loader)
+            .unwrap();
+        assert_ne!(after, sentinel);
+        assert_eq!(after, uncached(&doc, scrolled, HEIGHT, &theme, &loader));
+
+        let sentinel = poison(&mut cache, view);
+        let after = cache
+            .highlights(&doc, view, scrolled, HEIGHT + 5, &theme, &loader)
+            .unwrap();
+        assert_ne!(after, sentinel);
+        assert_eq!(after, uncached(&doc, scrolled, HEIGHT + 5, &theme, &loader));
+    }
+
+    #[test]
+    fn theme_change_invalidates_only_when_rainbow_length_changes() {
+        let loader = loader();
+        let doc = rust_doc(&loader);
+        let view = ViewId::default();
+        let anchor = line_anchor(&doc, 100);
+        let two = theme(r##"rainbow = ["#ff0000", "#00ff00"]"##);
+        let two_recolored = theme(r##"rainbow = ["#0000ff", "#ffff00"]"##);
+        let three = theme(r##"rainbow = ["#ff0000", "#00ff00", "#0000ff"]"##);
+        let mut cache = RainbowCache::default();
+        cache.highlights(&doc, view, anchor, HEIGHT, &two, &loader);
+
+        // Highlight ids are depth % length, so recoloring alone keeps them valid.
+        let sentinel = poison(&mut cache, view);
+        let same_len = cache.highlights(&doc, view, anchor, HEIGHT, &two_recolored, &loader);
+        assert_eq!(same_len, Some(sentinel.clone()));
+
+        let after = cache
+            .highlights(&doc, view, anchor, HEIGHT, &three, &loader)
+            .unwrap();
+        assert_ne!(after, sentinel);
+        assert_eq!(after, uncached(&doc, anchor, HEIGHT, &three, &loader));
+    }
+
+    #[test]
+    fn loader_and_syntax_replacement_invalidate() {
+        let loader_a = loader();
+        let theme = theme("");
+        let mut doc = rust_doc(&loader_a);
+        let view = ViewId::default();
+        let anchor = line_anchor(&doc, 100);
+        let mut cache = RainbowCache::default();
+        cache.highlights(&doc, view, anchor, HEIGHT, &theme, &loader_a);
+
+        // A config reload swaps in a new loader.
+        let loader_b = loader();
+        let sentinel = poison(&mut cache, view);
+        let after = cache
+            .highlights(&doc, view, anchor, HEIGHT, &theme, &loader_b)
+            .unwrap();
+        assert_ne!(after, sentinel);
+        assert_eq!(after, uncached(&doc, anchor, HEIGHT, &theme, &loader_b));
+
+        // A language change builds a fresh syntax with a new generation.
+        let sentinel = poison(&mut cache, view);
+        doc.set_language_by_language_id("rust", &loader_b).unwrap();
+        let after = cache
+            .highlights(&doc, view, anchor, HEIGHT, &theme, &loader_b)
+            .unwrap();
+        assert_ne!(after, sentinel);
+
+        // A different document in the same view never matches; its id and generation differ.
+        let sentinel = poison(&mut cache, view);
+        let other = rust_doc(&loader_b);
+        let after = cache
+            .highlights(&other, view, anchor, HEIGHT, &theme, &loader_b)
+            .unwrap();
+        assert_ne!(after, sentinel);
+
+        doc.set_language(None, &loader_b);
+        assert_eq!(
+            cache.highlights(&doc, view, anchor, HEIGHT, &theme, &loader_b),
+            None
+        );
+        assert!(!cache.entries.contains_key(&view));
+    }
+
+    #[test]
+    fn closed_views_are_dropped() {
+        let loader = loader();
+        let theme = theme("");
+        let doc = rust_doc(&loader);
+        let mut tree = Tree::new(Rect::new(0, 0, 80, 24));
+        let kept = tree.insert(View::new(DocumentId::default(), GutterConfig::default()));
+        let closed = tree.insert(View::new(DocumentId::default(), GutterConfig::default()));
+        let mut cache = RainbowCache::default();
+        for view in [kept, closed] {
+            cache.highlights(&doc, view, 0, HEIGHT, &theme, &loader);
+        }
+        assert_eq!(cache.entries.len(), 2);
+
+        tree.remove(closed);
+        cache.retain_views(&tree);
+        assert!(cache.entries.contains_key(&kept));
+        assert!(!cache.entries.contains_key(&closed));
+    }
+}
