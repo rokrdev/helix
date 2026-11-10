@@ -996,3 +996,49 @@ async fn document_highlight_debounce_requests_for_doc_the_view_left() -> anyhow:
 
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn code_action_hint_debounce_skips_closed_view() -> anyhow::Result<()> {
+    let mut config = test_config();
+    config
+        .editor
+        .gutters
+        .layout
+        .push(helix_view::editor::GutterType::CodeActionHint);
+    // Keep idle from firing before the 200 ms debounce does.
+    config.editor.idle_timeout = std::time::Duration::from_millis(1000);
+
+    let file = temp_file_with_contents("one two\n")?;
+    let mut app = AppBuilder::new()
+        .with_config(config)
+        .with_file(file.path(), None)
+        .build()?;
+
+    let doc_id = helix_view::doc!(app.editor).id();
+    app.editor
+        .switch(doc_id, helix_view::editor::Action::VerticalSplit);
+    let closed_view = app.editor.tree.focus;
+    app.editor.close(closed_view);
+    let live_view = app.editor.tree.focus;
+
+    // The live view's hint clears only if the debounce job ran.
+    helix_view::doc_mut!(app.editor, &doc_id).set_code_action_hints(live_view);
+
+    // Sent after the close to mimic an event queued before it.
+    for view_id in [closed_view, live_view] {
+        helix_event::send_blocking(
+            &app.editor.handlers.code_action_hint,
+            helix_view::handlers::lsp::CodeActionHintEvent {
+                document_id: doc_id,
+                view_id,
+            },
+        );
+    }
+    run_event_loop_until_idle(&mut app).await;
+
+    let doc = helix_view::doc!(app.editor, &doc_id);
+    assert!(!doc.code_action_hints(live_view));
+    assert!(!doc.selections().contains_key(&closed_view));
+
+    Ok(())
+}
