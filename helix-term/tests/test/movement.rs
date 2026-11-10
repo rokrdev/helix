@@ -942,7 +942,7 @@ async fn document_highlight_debounce_skips_closed_view() -> anyhow::Result<()> {
     // The live view's highlights clear only if the debounce job ran.
     helix_view::doc_mut!(app.editor, &doc_id).set_document_highlights(live_view, vec![0..3]);
 
-    // Stands in for an event queued before the close; its job runs after it.
+    // Sent after the close to mimic an event queued before it.
     for view_id in [closed_view, live_view] {
         helix_event::send_blocking(
             &app.editor.handlers.document_highlight,
