@@ -866,6 +866,62 @@ async fn document_highlights_cleared_on_move_without_language_server() -> anyhow
 
 #[allow(clippy::single_range_in_vec_init)]
 #[tokio::test(flavor = "multi_thread")]
+async fn document_highlights_cleared_on_edit_without_language_server() -> anyhow::Result<()> {
+    let mut config = test_config();
+    config.editor.lsp.auto_document_highlight = true;
+
+    let file = temp_file_with_contents("one two\n")?;
+    let mut app = AppBuilder::new()
+        .with_config(config)
+        .with_file(file.path(), None)
+        .build()?;
+
+    // No event loop: only an inline clear passes, not a queued job or debounce.
+    let (view, doc) = helix_view::current!(app.editor);
+    doc.set_document_highlights(view.id, vec![0..3]);
+    // No selection in the transaction, so only the edit hook can clear.
+    let transaction =
+        helix_core::Transaction::change(doc.text(), [(7, 7, Some("x".into()))].into_iter());
+    assert!(doc.apply(&transaction, view.id));
+    assert_eq!(doc.text().to_string(), "one twox\n");
+    assert!(doc.document_highlights(view.id).is_none());
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn document_highlight_edit_then_close_does_not_revive_view() -> anyhow::Result<()> {
+    let mut config = test_config();
+    config.editor.lsp.auto_document_highlight = true;
+
+    let file = temp_file_with_contents("one two\n")?;
+    let mut app = AppBuilder::new()
+        .with_config(config)
+        .with_file(file.path(), None)
+        .build()?;
+
+    let doc_id = helix_view::doc!(app.editor).id();
+    app.editor
+        .switch(doc_id, helix_view::editor::Action::VerticalSplit);
+    let closed_view = app.editor.tree.focus;
+
+    // An edit job queued before the close must not re-add the view.
+    let doc = helix_view::doc_mut!(app.editor, &doc_id);
+    let transaction =
+        helix_core::Transaction::change(doc.text(), [(7, 7, Some("x".into()))].into_iter());
+    assert!(doc.apply(&transaction, closed_view));
+    app.editor.close(closed_view);
+    run_event_loop_until_idle(&mut app).await;
+
+    let doc = helix_view::doc!(app.editor, &doc_id);
+    assert_eq!(doc.text().to_string(), "one twox\n");
+    assert!(!doc.selections().contains_key(&closed_view));
+
+    Ok(())
+}
+
+#[allow(clippy::single_range_in_vec_init)]
+#[tokio::test(flavor = "multi_thread")]
 async fn document_highlight_debounce_skips_closed_view() -> anyhow::Result<()> {
     let mut config = test_config();
     config.editor.lsp.auto_document_highlight = true;

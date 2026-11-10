@@ -9,9 +9,9 @@ use helix_view::{
         LanguageServerInitialized, SelectionDidChange,
     },
     handlers::{lsp::DocumentHighlightEvent, Handlers},
-    DocumentId, Editor, ViewId,
+    Document, DocumentId, Editor, ViewId,
 };
-use tokio::time::Instant;
+use tokio::{sync::mpsc::Sender, time::Instant};
 
 use crate::job;
 
@@ -156,28 +156,32 @@ fn apply_document_highlights(
     doc.set_document_highlights(view_id, ranges);
 }
 
+fn schedule_document_highlights(
+    tx: &Sender<DocumentHighlightEvent>,
+    doc: &mut Document,
+    view_id: ViewId,
+) {
+    // No server means nothing to request, so clear inline instead of queuing a job.
+    if !doc.has_language_server_with_feature(LanguageServerFeature::DocumentHighlight) {
+        doc.clear_document_highlights(view_id);
+        return;
+    }
+    // Drop an in-flight request computed for the old cursor or text.
+    doc.document_highlight_controller(view_id).cancel();
+    send_blocking(
+        tx,
+        DocumentHighlightEvent {
+            document_id: doc.id(),
+            view_id,
+        },
+    );
+}
+
 pub(super) fn register_hooks(handlers: &Handlers) {
     let tx = handlers.document_highlight.clone();
     register_hook!(move |event: &mut SelectionDidChange<'_>| {
         if event.doc.config.load().lsp.auto_document_highlight {
-            let view_id = event.view;
-            // No server means nothing to request, so clear inline instead of queuing a job.
-            if !event
-                .doc
-                .has_language_server_with_feature(LanguageServerFeature::DocumentHighlight)
-            {
-                event.doc.clear_document_highlights(view_id);
-                return Ok(());
-            }
-            // Drop a slow in-flight request so it cannot paint the old position.
-            event.doc.document_highlight_controller(view_id).cancel();
-            send_blocking(
-                &tx,
-                DocumentHighlightEvent {
-                    document_id: event.doc.id(),
-                    view_id,
-                },
-            );
+            schedule_document_highlights(&tx, event.doc, event.view);
         }
         Ok(())
     });
@@ -194,13 +198,10 @@ pub(super) fn register_hooks(handlers: &Handlers) {
         Ok(())
     });
 
+    let tx = handlers.document_highlight.clone();
     register_hook!(move |event: &mut DocumentDidChange<'_>| {
         if event.doc.config.load().lsp.auto_document_highlight && !event.ghost_transaction {
-            let doc_id = event.doc.id();
-            let view_id = event.view;
-            job::dispatch_blocking(move |editor, _| {
-                request_document_highlights(editor, doc_id, view_id);
-            });
+            schedule_document_highlights(&tx, event.doc, event.view);
         }
         Ok(())
     });
