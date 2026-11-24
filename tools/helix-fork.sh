@@ -5,7 +5,7 @@
 # Layout:
 #   master          mirror of upstream/master (never carries our patches)
 #   custom          our patched branch: merges every patch/pr-<N> topic branch
-#   patch/pr-<N>    one topic branch per upstream PR, rebased onto master
+#   patch/pr-<N>    one topic branch per upstream PR, mirrors the PR head (never rebased)
 #
 # Workflow:
 #   tools/helix-fork.sh fetch            fetch upstream + all open PR heads
@@ -33,6 +33,29 @@ fetch() {
     || die "fetch PR heads failed"
 }
 
+# Branch switches carry local edits along, so a dirty tree breaks merges in odd ways.
+require_clean_tree() {
+  git diff --quiet && git diff --cached --quiet || die "working tree not clean, commit or stash first"
+}
+
+# Call after a failed merge into custom. Mid-merge advice only makes sense if a merge started.
+merge_failed() {
+  local src="$1"
+  shift
+  git rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1 \
+    || die "merge of $src into $CUSTOM failed"
+  {
+    echo "CONFLICT merging $src into $CUSTOM. You are still on $CUSTOM, mid-merge."
+    echo "Resolve the conflicted files, then run:"
+    echo "  git add <files>"
+    echo "  git commit"
+    local line
+    for line in "$@"; do echo "$line"; done
+    echo "To bail out instead: git merge --abort"
+  } >&2
+  exit 1
+}
+
 ensure_custom() {
   git rev-parse --verify "$CUSTOM" >/dev/null 2>&1 || {
     echo "creating $CUSTOM from master"
@@ -43,6 +66,7 @@ ensure_custom() {
 add_pr() {
   local n="$1"
   [[ "$n" =~ ^[0-9]+$ ]] || die "PR number must be numeric, got: $n"
+  require_clean_tree
   fetch
   local src="refs/remotes/$UPSTREAM/pr-$n"
   git rev-parse --verify "$src" >/dev/null 2>&1 \
@@ -77,18 +101,20 @@ finish_pr() {
   else
     echo "merging $topic into custom"
     git merge --no-ff "$topic" -m "merge upstream PR #$n ($topic)" \
-      || die "merge of $topic into custom had conflicts — resolve and commit manually"
+      || merge_failed "$topic"
   fi
   git checkout -q master
 }
 
 sync() {
+  require_clean_tree
   fetch
-  ensure_custom
   echo "== fast-forwarding master to $UPSTREAM/master =="
   git checkout -q master || die "checkout master failed"
   git merge --ff-only "$UPSTREAM/master" \
     || die "master has diverged from $UPSTREAM/master, fix it by hand (master must only mirror upstream)"
+  # After the ff, so a missing custom starts at the new master and needs no empty merge.
+  ensure_custom
   git checkout -q "$CUSTOM" || die "checkout custom failed"
   local sha
   sha="$(git rev-parse --short master)"
@@ -96,16 +122,10 @@ sync() {
     echo "custom already contains master @ $sha, nothing to merge"
   else
     echo "== merging master @ $sha into custom =="
-    git merge --no-ff master -m "merge upstream/master ($sha) into custom" || {
-      echo "CONFLICT merging master into custom. You are still on custom, mid-merge." >&2
-      echo "Resolve the conflicted files, then run:" >&2
-      echo "  git add <files>" >&2
-      echo "  git commit" >&2
-      echo "Rule: if a conflict is because upstream now contains one of your patches," >&2
-      echo "take upstream's side, then drop that patch's patch/pr-<N> branch and table row." >&2
-      echo "To bail out instead: git merge --abort" >&2
-      exit 1
-    }
+    git merge --no-ff master -m "merge upstream/master ($sha) into custom" \
+      || merge_failed master \
+        "Rule: if a conflict is because upstream now contains one of your patches," \
+        "take upstream's side, then drop that patch's patch/pr-<N> branch and table row."
   fi
   git checkout -q master
   echo "custom synced. run 'tools/helix-fork.sh build' to compile."
