@@ -85,6 +85,10 @@ finish_pr() {
 sync() {
   fetch
   ensure_custom
+  echo "== fast-forwarding master to $UPSTREAM/master =="
+  git checkout -q master || die "checkout master failed"
+  git merge --ff-only "$UPSTREAM/master" \
+    || die "master has diverged from $UPSTREAM/master, fix it by hand (master must only mirror upstream)"
   echo "== rebasing custom onto master =="
   git checkout -q "$CUSTOM"
   git rebase master
