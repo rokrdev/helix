@@ -8,8 +8,8 @@
 #   patch/pr-<N>    one topic branch per upstream PR, mirrors the PR head (never rebased)
 #
 # Workflow:
-#   tools/helix-fork.sh fetch            fetch upstream + all open PR heads
-#   tools/helix-fork.sh add-pr 1234      merge PR #1234 into custom, re-run to pick up PR updates
+#   tools/helix-fork.sh fetch            fetch upstream (no PR heads)
+#   tools/helix-fork.sh add-pr 1234      fetch PR #1234, merge into custom, re-run to pick up PR updates
 #   tools/helix-fork.sh sync             ff master to upstream, merge master into custom
 #   tools/helix-fork.sh build            cargo build the custom branch
 #   tools/helix-fork.sh push             push master + custom, force-with-lease patch branches
@@ -26,12 +26,18 @@ PR_PREFIX="patch/pr-"
 
 die() { echo "error: $*" >&2; exit 1; }
 
-fetch() {
+current_ref() { git symbolic-ref --short -q HEAD || git rev-parse HEAD; }
+START="$(current_ref)"
+
+# tools/ exists only on custom, so land back where we started or the script vanishes.
+return_to_start() {
+  [[ "$(current_ref)" == "$START" ]] || git checkout -q "$START" 2>/dev/null || true
+}
+trap return_to_start EXIT
+
+fetch_upstream() {
   echo "== fetching upstream =="
   git fetch "$UPSTREAM" || die "fetch upstream failed"
-  echo "== fetching upstream PR heads =="
-  git fetch "$UPSTREAM" '+refs/pull/*/head:refs/remotes/upstream/pr-*' \
-    || die "fetch PR heads failed"
 }
 
 # Branch switches carry local edits along, so a dirty tree breaks merges in odd ways.
@@ -54,6 +60,8 @@ merge_failed() {
     for line in "$@"; do echo "$line"; done
     echo "To bail out instead: git merge --abort"
   } >&2
+  # The merge is open on custom, so do not switch away from it.
+  trap - EXIT
   exit 1
 }
 
@@ -68,13 +76,13 @@ add_pr() {
   local n="$1"
   [[ "$n" =~ ^[0-9]+$ ]] || die "PR number must be numeric, got: $n"
   require_clean_tree
-  fetch
   local src="refs/remotes/$UPSTREAM/pr-$n"
-  git rev-parse --verify "$src" >/dev/null 2>&1 \
-    || die "no PR $n in fetched refs — is it open? (run fetch, check gh pr view $n)"
+  echo "== fetching PR $n head =="
+  git fetch "$UPSTREAM" "+refs/pull/$n/head:$src" \
+    || die "cannot fetch PR $n, is it open? (check: gh pr view $n)"
   local topic="$PR_PREFIX$n"
   # The branch mirrors the PR head, even after an author force-push.
-  git branch -f "$topic" "$src" || die "cannot update topic branch $topic"
+  git branch -f --no-track "$topic" "$src" || die "cannot update topic branch $topic"
   ensure_custom
   if git merge-base --is-ancestor "$topic" "$CUSTOM"; then
     echo "PR $n already up to date in $CUSTOM"
@@ -87,12 +95,11 @@ add_pr() {
   git checkout -q "$CUSTOM" || die "checkout $CUSTOM failed"
   echo "== merging $topic into $CUSTOM =="
   git merge --no-ff "$topic" -m "$verb upstream PR #$n ($topic)" || merge_failed "$topic"
-  git checkout -q master
 }
 
 sync() {
   require_clean_tree
-  fetch
+  fetch_upstream
   echo "== fast-forwarding master to $UPSTREAM/master =="
   git checkout -q master || die "checkout master failed"
   git merge --ff-only "$UPSTREAM/master" \
@@ -111,7 +118,6 @@ sync() {
         "Rule: if a conflict is because upstream now contains one of your patches," \
         "take upstream's side, then drop that patch's patch/pr-<N> branch and table row."
   fi
-  git checkout -q master
   echo "custom synced. run 'tools/helix-fork.sh build' to compile."
 }
 
@@ -131,7 +137,6 @@ build() {
   rsync -a --exclude '/grammars/sources/' \
     "$REPO_ROOT/runtime/" "$REPO_ROOT/target/release/runtime/" \
     && echo "== runtime -> target/release/runtime =="
-  git checkout -q master
   echo "binary: $REPO_ROOT/target/release/hx"
 }
 
@@ -180,7 +185,7 @@ status() {
 }
 
 case "${1:-}" in
-  fetch)   fetch ;;
+  fetch)   fetch_upstream ;;
   add-pr)  [[ $# -ge 2 ]] || die "usage: helix-fork.sh add-pr <PR#>"; add_pr "$2" ;;
   sync)    sync ;;
   build)   shift; build "$@" ;;

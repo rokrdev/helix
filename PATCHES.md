@@ -21,10 +21,11 @@ Add a PR you want:
 
     tools/helix-fork.sh add-pr 1234
 
-This fetches upstream and the PR heads, then points `patch/pr-1234` at the
-PR's current head. It does not rebase anything. Then it merges the branch into
-`custom` with `--no-ff`. The merge commit is `merge upstream PR #1234 (patch/pr-1234)`
-the first time and `update upstream PR #1234 (patch/pr-1234)` after that.
+This fetches only that PR's head (`refs/pull/1234/head`), then points
+`patch/pr-1234` at it. It does not fetch other PRs and does not rebase anything.
+Then it merges the branch into `custom` with `--no-ff`. The merge commit is
+`merge upstream PR #1234 (patch/pr-1234)` the first time and
+`update upstream PR #1234 (patch/pr-1234)` after that.
 
 To pick up new PR commits, run `add-pr` again. Only the new commits come in, and
 `custom` is never rewritten. If the PR head is already in `custom`, the script
@@ -39,14 +40,20 @@ branch is already at the PR head by then.
 `add-pr` and `sync` refuse to run when tracked files have uncommitted changes.
 Commit or stash first.
 
+`add-pr`, `sync` and `build` switch branches while they work. When they finish
+they put you back on the branch you started on, or on the same commit if you
+started detached. `tools/` only exists on `custom`, so run the script from there
+and it stays in your working tree. If a merge conflicts, you stay on `custom`,
+mid-merge, wherever you started. Other errors also try to take you back.
+
 Pull fresh upstream:
 
     tools/helix-fork.sh sync
 
-This fetches upstream, fast-forwards `master`, and merges `master` into `custom`
-with a merge commit. Nothing is rebased, so history is never rewritten and `sync`
-never needs a force push. The patch branches are not touched, because they are
-already merged into `custom`.
+This fetches upstream (branches only, no PR heads), fast-forwards `master`, and
+merges `master` into `custom` with a merge commit. Nothing is rebased, so history
+is never rewritten and `sync` never needs a force push. The patch branches are not
+touched, because they are already merged into `custom`.
 
 If the merge conflicts, the script stops on `custom` in the middle of the merge.
 Resolve the files, then `git add` them and run `git commit`. If the conflict is
