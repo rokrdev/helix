@@ -9,17 +9,18 @@
 #
 # Workflow:
 #   tools/helix-fork.sh fetch            fetch upstream + all open PR heads
-#   tools/helix-fork.sh add-pr 1234      bring PR #1234 into custom as a clean merge
+#   tools/helix-fork.sh add-pr 1234      merge PR #1234 into custom, re-run to pick up PR updates
 #   tools/helix-fork.sh sync             ff master to upstream, merge master into custom
 #   tools/helix-fork.sh build            cargo build the custom branch
-#   tools/helix-fork.sh push             push custom + master to your fork
-#   tools/helix-fork.sh status           what your custom branch adds vs master
+#   tools/helix-fork.sh push             push master + custom, force-with-lease patch branches
+#   tools/helix-fork.sh status           patch branches (local + origin) and what custom adds
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
 UPSTREAM="upstream"
+ORIGIN="origin"
 CUSTOM="custom"
 PR_PREFIX="patch/pr-"
 
@@ -38,7 +39,7 @@ require_clean_tree() {
   git diff --quiet && git diff --cached --quiet || die "working tree not clean, commit or stash first"
 }
 
-# Call after a failed merge into custom. Mid-merge advice only makes sense if a merge started.
+# Mid-merge advice only makes sense if a merge actually started.
 merge_failed() {
   local src="$1"
   shift
@@ -72,37 +73,20 @@ add_pr() {
   git rev-parse --verify "$src" >/dev/null 2>&1 \
     || die "no PR $n in fetched refs — is it open? (run fetch, check gh pr view $n)"
   local topic="$PR_PREFIX$n"
-  # (re)create topic branch from the PR head
-  git branch -f "$topic" "$src" || die "cannot create topic branch $topic"
-  # ensure it sits cleanly on top of current master
-  if ! git merge-base --is-ancestor master "$topic"; then
-    echo "rebasing $topic onto master"
-    git checkout -q "$topic" || die "checkout $topic failed"
-    if ! git rebase master; then
-      echo "CONFLICT while rebasing $topic onto master. Resolve, then run:" >&2
-      echo "  git rebase --continue" >&2
-      echo "  tools/helix-fork.sh finish-pr $n" >&2
-      exit 1
-    fi
-  else
-    git checkout -q "$topic"
-    git rebase master  # no-op if already based on master
-  fi
-  finish_pr "$n"
-}
-
-finish_pr() {
-  local n="$1"
-  local topic="$PR_PREFIX$n"
+  # The branch mirrors the PR head, even after an author force-push.
+  git branch -f "$topic" "$src" || die "cannot update topic branch $topic"
   ensure_custom
-  git checkout -q "$CUSTOM" || die "checkout custom failed"
   if git merge-base --is-ancestor "$topic" "$CUSTOM"; then
-    echo "PR $n already merged into custom (nothing to do)"
-  else
-    echo "merging $topic into custom"
-    git merge --no-ff "$topic" -m "merge upstream PR #$n ($topic)" \
-      || merge_failed "$topic"
+    echo "PR $n already up to date in $CUSTOM"
+    return
   fi
+  # Custom is never rewritten, so an earlier merge stays in its first-parent log.
+  local verb="merge"
+  [[ -z "$(git log --first-parent --fixed-strings --grep="upstream PR #$n ($topic)" -1 --format=%h "$CUSTOM")" ]] \
+    || verb="update"
+  git checkout -q "$CUSTOM" || die "checkout $CUSTOM failed"
+  echo "== merging $topic into $CUSTOM =="
+  git merge --no-ff "$topic" -m "$verb upstream PR #$n ($topic)" || merge_failed "$topic"
   git checkout -q master
 }
 
@@ -113,7 +97,7 @@ sync() {
   git checkout -q master || die "checkout master failed"
   git merge --ff-only "$UPSTREAM/master" \
     || die "master has diverged from $UPSTREAM/master, fix it by hand (master must only mirror upstream)"
-  # After the ff, so a missing custom starts at the new master and needs no empty merge.
+  # After the ff, so a new custom starts at the new master.
   ensure_custom
   git checkout -q "$CUSTOM" || die "checkout custom failed"
   local sha
@@ -152,13 +136,22 @@ build() {
 }
 
 push() {
-  local remote="${1:-origin}"
+  local remote="${1:-$ORIGIN}"
   echo "== pushing master =="
   git push "$remote" master
   echo "== pushing custom =="
   git push "$remote" custom
-  echo "== pushing patch branches =="
-  git push "$remote" $(git for-each-ref --format='%(refname:short)' "refs/heads/$PR_PREFIX*")
+  local patches
+  patches="$(git for-each-ref --format='%(refname:short)' "refs/heads/$PR_PREFIX*")"
+  if [[ -z "$patches" ]]; then
+    echo "== no local $PR_PREFIX* branches, skipping patch branches =="
+    return
+  fi
+  # Patch branches mirror PR heads, which authors rewrite. The lease limits the damage.
+  echo "== pushing patch branches (--force-with-lease) =="
+  # shellcheck disable=SC2086 # branch names never contain spaces
+  git push --force-with-lease "$remote" $patches \
+    || die "patch branch push failed. If it says stale info, run: git fetch $remote"
 }
 
 status() {
@@ -167,9 +160,20 @@ status() {
   echo "== custom @ $(git rev-parse --short custom) =="
   echo
   echo "patch branches:"
-  git for-each-ref --format='%(refname:short)  %(objectname:short)' "refs/heads/$PR_PREFIX*" || true
-  [[ -z "$(git for-each-ref --format='%(refname:short)' "refs/heads/$PR_PREFIX*")" ]] \
-    && echo "  (none yet — run: tools/helix-fork.sh add-pr <N>)"
+  local ref name sha where merged found=0
+  while read -r ref name sha; do
+    found=1
+    where="local"
+    [[ "$ref" == refs/remotes/* ]] && where="$ORIGIN"
+    if git merge-base --is-ancestor "$ref" "$CUSTOM"; then
+      merged="merged into $CUSTOM"
+    else
+      merged="not merged into $CUSTOM"
+    fi
+    printf '  %-28s %s  %-7s %s\n' "$name" "$sha" "$where" "$merged"
+  done < <(git for-each-ref --format='%(refname) %(refname:short) %(objectname:short)' \
+    "refs/heads/$PR_PREFIX*" "refs/remotes/$ORIGIN/$PR_PREFIX*")
+  [[ "$found" -eq 1 ]] || echo "  (none yet — run: tools/helix-fork.sh add-pr <N>)"
   echo
   echo "custom vs master diffstat:"
   git diff --stat master custom
@@ -178,7 +182,6 @@ status() {
 case "${1:-}" in
   fetch)   fetch ;;
   add-pr)  [[ $# -ge 2 ]] || die "usage: helix-fork.sh add-pr <PR#>"; add_pr "$2" ;;
-  finish-pr) [[ $# -ge 2 ]] || die "usage: helix-fork.sh finish-pr <PR#>"; finish_pr "$2" ;;
   sync)    sync ;;
   build)   shift; build "$@" ;;
   push)    shift; push "$@" ;;
