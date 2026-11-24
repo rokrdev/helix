@@ -14,6 +14,38 @@ mod git;
 #[cfg(feature = "git")]
 pub use git::blame::FileBlame;
 
+// Dependents name `FileBlame` unconditionally, so builds without `git` need a stand-in.
+#[cfg(not(feature = "git"))]
+pub use no_git_blame::FileBlame;
+#[cfg(not(feature = "git"))]
+mod no_git_blame {
+    use anyhow::{bail, Result};
+    use std::{convert::Infallible, path::PathBuf};
+
+    /// Never constructed: `try_new` always fails, so the other methods are unreachable.
+    #[derive(Debug)]
+    pub struct FileBlame(Infallible);
+
+    #[derive(Clone, Debug)]
+    pub struct LineBlame(Infallible);
+
+    impl FileBlame {
+        pub fn try_new(_file: PathBuf) -> Result<Self> {
+            bail!("No blame support compiled in")
+        }
+
+        pub fn blame_for_line(&self, _line: u32, _inserted: u32, _removed: u32) -> LineBlame {
+            match self.0 {}
+        }
+    }
+
+    impl LineBlame {
+        pub fn parse_format(&mut self, _format: &str) -> String {
+            match self.0 {}
+        }
+    }
+}
+
 mod diff;
 
 pub use diff::{DiffHandle, Hunk};
