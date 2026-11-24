@@ -761,8 +761,13 @@ impl Component for CallHierarchyPicker {
             key!(Left) => {
                 self.state.key_left();
             }
-            key!(Right) | key!(Enter) => {
+            key!(Right) => {
                 self.toggle_selected(ctx);
+            }
+            // Enter jumps like other pickers, so only Right expands now.
+            key!(Enter) => {
+                self.jump_selected(ctx.editor, Action::Replace);
+                return EventResult::Consumed(Some(close));
             }
             alt!(Enter) => {
                 self.jump_selected(ctx.editor, Action::Replace);
