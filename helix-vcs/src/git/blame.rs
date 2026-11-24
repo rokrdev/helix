@@ -1,5 +1,6 @@
 use anyhow::Context as _;
 use anyhow::Result;
+use helix_core::graphemes::render_grapheme;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -244,7 +245,8 @@ impl LineBlame {
             }
         }
 
-        line_blame
+        // Commit text is untrusted and must not reach the terminal with control characters.
+        render_grapheme(&line_blame).into_owned()
     }
 }
 
@@ -620,6 +622,25 @@ mod test {
             }
             .parse_format(format),
             "2028-01-10 • f14ab1cf".to_owned()
+        );
+    }
+
+    #[test]
+    pub fn inline_blame_replaces_control_characters() {
+        let blame = LineBlame {
+            author_name: Some("Bob\r".to_owned()),
+            commit_title: Some("\x1b[31mred\x1b[0m\ttitle".to_owned()),
+            commit_body: Some("line one\nline two".to_owned()),
+            ..bob()
+        };
+
+        assert_eq!(
+            blame.clone().parse_format("{author} • {title}"),
+            "Bob\u{FFFD} • \u{FFFD}[31mred\u{FFFD}[0m\u{FFFD}title"
+        );
+        assert_eq!(
+            blame.clone().parse_format("{body}"),
+            "line one\u{FFFD}line two"
         );
     }
 }
