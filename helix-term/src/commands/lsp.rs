@@ -400,6 +400,20 @@ impl CallHierarchyPicker {
         }
     }
 
+    fn layout(
+        &self,
+        area: helix_view::graphics::Rect,
+    ) -> (
+        helix_view::graphics::Rect,
+        Option<helix_view::graphics::Rect>,
+    ) {
+        if self.selected_entry().is_some() {
+            ui::picker::preview_layout(area)
+        } else {
+            (area, None)
+        }
+    }
+
     fn render_tree(
         &mut self,
         area: helix_view::graphics::Rect,
@@ -693,20 +707,10 @@ impl Component for CallHierarchyPicker {
         surface: &mut tui::buffer::Buffer,
         cx: &mut compositor::Context,
     ) {
-        let render_preview =
-            self.selected_entry().is_some() && area.width > ui::picker::MIN_AREA_WIDTH_FOR_PREVIEW;
-
-        let tree_width = if render_preview {
-            area.width / 2
-        } else {
-            area.width
-        };
-
-        let tree_area = area.with_width(tree_width);
+        let (tree_area, preview_area) = self.layout(area);
         self.render_tree(tree_area, surface, cx);
 
-        if render_preview {
-            let preview_area = area.clip_left(tree_width);
+        if let Some(preview_area) = preview_area {
             let location = self.selected_entry().and_then(|entry| {
                 let path = entry.preview_location.uri.as_path()?.to_path_buf();
                 let line = Some((
@@ -2405,6 +2409,49 @@ mod test {
         assert!(picker.state.opened().contains(&vec![0]));
         assert!(picker.state.opened().contains(&vec![0, 2]));
         assert_eq!(picker.state.selected(), [0, 2]);
+    }
+
+    #[test]
+    fn portrait_terminal_stacks_preview_above_tree() {
+        use helix_view::graphics::Rect;
+
+        let picker =
+            CallHierarchyPicker::new(CallHierarchyDirection::Incoming, vec![test_entry(0)]);
+        let area = Rect::new(0, 0, 80, 60);
+
+        let (tree, preview) = picker.layout(area);
+
+        let preview = preview.expect("80x60 fits a stacked preview");
+        assert_eq!(preview, Rect::new(0, 0, 80, 40));
+        assert_eq!(tree, Rect::new(0, 40, 80, 20));
+    }
+
+    #[test]
+    fn landscape_terminal_puts_preview_beside_tree() {
+        use helix_view::graphics::Rect;
+
+        let picker =
+            CallHierarchyPicker::new(CallHierarchyDirection::Incoming, vec![test_entry(0)]);
+        let area = Rect::new(0, 0, 200, 50);
+
+        let (tree, preview) = picker.layout(area);
+
+        assert_eq!(tree, Rect::new(0, 0, 100, 50));
+        assert_eq!(preview, Some(Rect::new(100, 0, 100, 50)));
+    }
+
+    #[test]
+    fn small_terminal_or_empty_selection_hides_preview() {
+        use helix_view::graphics::Rect;
+
+        let picker =
+            CallHierarchyPicker::new(CallHierarchyDirection::Incoming, vec![test_entry(0)]);
+        let small = Rect::new(0, 0, 60, 20);
+        assert_eq!(picker.layout(small), (small, None));
+
+        let empty = CallHierarchyPicker::new(CallHierarchyDirection::Incoming, Vec::new());
+        let big = Rect::new(0, 0, 200, 50);
+        assert_eq!(empty.layout(big), (big, None));
     }
 
     #[test]

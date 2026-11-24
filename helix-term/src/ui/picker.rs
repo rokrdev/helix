@@ -1439,6 +1439,22 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> PreviewHost for Picker<
     }
 }
 
+/// Splits `area` into the list area and an optional preview area.
+pub(crate) fn preview_layout(area: Rect) -> (Rect, Option<Rect>) {
+    let fits_beside = area.width > MIN_AREA_WIDTH_FOR_PREVIEW;
+    let fits_stacked = area.height >= MIN_AREA_HEIGHT_FOR_STACKED_PREVIEW;
+    let portrait = area.width < CELL_ASPECT * area.height;
+    if fits_stacked && (portrait || !fits_beside) {
+        let preview = area.with_height(area.height - area.height / 3);
+        (area.clip_top(preview.height), Some(preview))
+    } else if fits_beside {
+        let picker = area.with_width(area.width / 2);
+        (picker, Some(area.clip_left(picker.width)))
+    } else {
+        (area, None)
+    }
+}
+
 impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Picker<I, D> {
     fn layout(&self, area: Rect) -> (Rect, Option<Rect>) {
         // +---------+ +---------+    +---------+
@@ -1453,18 +1469,7 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Picker<I, D> {
         if !self.show_preview || self.file_fn.is_none() {
             return (area, None);
         }
-        let fits_beside = area.width > MIN_AREA_WIDTH_FOR_PREVIEW;
-        let fits_stacked = area.height >= MIN_AREA_HEIGHT_FOR_STACKED_PREVIEW;
-        let portrait = area.width < CELL_ASPECT * area.height;
-        if fits_stacked && (portrait || !fits_beside) {
-            let preview = area.with_height(area.height - area.height / 3);
-            (area.clip_top(preview.height), Some(preview))
-        } else if fits_beside {
-            let picker = area.with_width(area.width / 2);
-            (picker, Some(area.clip_left(picker.width)))
-        } else {
-            (area, None)
-        }
+        preview_layout(area)
     }
 }
 
