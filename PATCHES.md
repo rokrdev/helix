@@ -38,13 +38,17 @@ the merge. Resolve the files, then `git add` them and run `git commit`. The patc
 branch is already at the PR head by then.
 
 `add-pr` and `sync` refuse to run when tracked files have uncommitted changes.
-Commit or stash first.
+Commit or stash first. They also refuse while a merge is in progress, even if you
+already resolved it. Finish it with `git commit` or drop it with `git merge --abort`.
 
 `add-pr`, `sync` and `build` switch branches while they work. When they finish
 they put you back on the branch you started on, or on the same commit if you
 started detached. `tools/` only exists on `custom`, so run the script from there
-and it stays in your working tree. If a merge conflicts, you stay on `custom`,
-mid-merge, wherever you started. Other errors also try to take you back.
+and it stays in your working tree. If a merge conflicts, or a merge hook stops it
+before the commit, you stay on `custom`, mid-merge, wherever you started. Other
+errors also try to take you back. If that switch fails, the script prints
+`note: could not switch back to <branch>, you are on <branch>` and keeps its own
+exit status.
 
 Pull fresh upstream:
 

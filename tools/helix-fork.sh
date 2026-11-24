@@ -31,7 +31,10 @@ START="$(current_ref)"
 
 # tools/ exists only on custom, so land back where we started or the script vanishes.
 return_to_start() {
-  [[ "$(current_ref)" == "$START" ]] || git checkout -q "$START" 2>/dev/null || true
+  [[ "$(current_ref)" == "$START" ]] && return 0
+  # No exit here: the EXIT trap keeps the script's original status.
+  git checkout -q "$START" \
+    || echo "note: could not switch back to $START, you are on $(current_ref)" >&2
 }
 trap return_to_start EXIT
 
@@ -41,7 +44,11 @@ fetch_upstream() {
 }
 
 # Branch switches carry local edits along, so a dirty tree breaks merges in odd ways.
+# A resolved but uncommitted merge has a clean index, so check MERGE_HEAD too.
 require_clean_tree() {
+  if git rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then
+    die "a merge is in progress, finish it with git commit or git merge --abort"
+  fi
   git diff --quiet && git diff --cached --quiet || die "working tree not clean, commit or stash first"
 }
 
@@ -52,9 +59,14 @@ merge_failed() {
   git rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1 \
     || die "merge of $src into $CUSTOM failed"
   {
-    echo "CONFLICT merging $src into $CUSTOM. You are still on $CUSTOM, mid-merge."
-    echo "Resolve the conflicted files, then run:"
-    echo "  git add <files>"
+    if [[ -n "$(git diff --name-only --diff-filter=U)" ]]; then
+      echo "CONFLICT merging $src into $CUSTOM. You are still on $CUSTOM, mid-merge."
+      echo "Resolve the conflicted files, then run:"
+      echo "  git add <files>"
+    else
+      echo "$src into $CUSTOM: merge stopped before committing (a hook may have failed)."
+      echo "You are still on $CUSTOM, mid-merge. Fix the cause, then run:"
+    fi
     echo "  git commit"
     local line
     for line in "$@"; do echo "$line"; done
