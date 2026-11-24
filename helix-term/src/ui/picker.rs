@@ -1090,7 +1090,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             }
             self.cursor = self
                 .cursor
-                .min(self.ordered_len(&snapshot).saturating_sub(1))
+                .min(self.ordered_len(snapshot).saturating_sub(1))
         }
 
         let text_style = cx.editor.theme.get("ui.text");
@@ -1151,9 +1151,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         let rows = inner.height.saturating_sub(self.header_height()) as u32;
         let offset = self.cursor - (self.cursor % std::cmp::max(1, rows));
         let cursor = self.cursor.saturating_sub(offset);
-        let end = offset
-            .saturating_add(rows)
-            .min(self.ordered_len(&snapshot));
+        let end = offset.saturating_add(rows).min(self.ordered_len(snapshot));
         let mut indices = Vec::new();
         let mut matcher = MATCHER.lock();
         matcher.config = Config::DEFAULT;

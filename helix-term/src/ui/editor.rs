@@ -679,6 +679,7 @@ impl EditorView {
     /// blame. `line` is the cursor line in `CursorLine` mode and `None` in
     /// `AllLines` mode. The only side effect is recording the freshly armed
     /// deadline in the `Debounce` case, which makes it unit-testable.
+    #[allow(clippy::too_many_arguments)]
     fn decide_blame(
         state: &mut InlineBlameRenderState,
         anchor: usize,
@@ -2297,6 +2298,7 @@ mod blame_debounce_tests {
     /// Mirror what `all_lines_blame` / `cursor_line_blame` do: `decide_blame`
     /// is pure, so on a `Compute` decision we record the result in the state
     /// (like the real render path would after computing the blame).
+    #[allow(clippy::too_many_arguments)]
     fn next(
         state: &mut InlineBlameRenderState,
         anchor: usize,
