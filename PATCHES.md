@@ -9,7 +9,7 @@ Remote: `git@github.com:rokrdev/helix.git`
 
     master            mirror of upstream/master — never carries our patches
     custom            our patched branch (merges every patch/pr-<N>)
-    patch/pr-<N>      one topic branch per upstream PR, rebased onto master when added
+    patch/pr-<N>      one topic branch per upstream PR, a copy of the PR head (never rebased)
     tools/helix-fork.sh   all maintenance operations
 
 The fork's `master` stays byte-identical to upstream, so `git diff master custom`
@@ -21,9 +21,23 @@ Add a PR you want:
 
     tools/helix-fork.sh add-pr 1234
 
-This fetches upstream + open PR heads, recreates `patch/pr-1234` from the PR's
-current tip, rebases it onto `master`, and merges it (--no-ff) into `custom`.
-To pick up new commits the PR author pushed, run `add-pr` again.
+This fetches upstream and the PR heads, then points `patch/pr-1234` at the
+PR's current head. It does not rebase anything. Then it merges the branch into
+`custom` with `--no-ff`. The merge commit is `merge upstream PR #1234 (patch/pr-1234)`
+the first time and `update upstream PR #1234 (patch/pr-1234)` after that.
+
+To pick up new PR commits, run `add-pr` again. Only the new commits come in, and
+`custom` is never rewritten. If the PR head is already in `custom`, the script
+prints "already up to date" and does nothing.
+
+If the author force-pushed, the patch branch moves to the rewritten head and the
+merge is a normal three-way merge. Changes `custom` already has resolve cleanly.
+A real change can conflict. Then the script stops on `custom` in the middle of
+the merge. Resolve the files, then `git add` them and run `git commit`. The patch
+branch is already at the PR head by then.
+
+`add-pr` and `sync` refuse to run when tracked files have uncommitted changes.
+Commit or stash first.
 
 Pull fresh upstream:
 
@@ -46,11 +60,24 @@ Build the patched editor:
 
 Publish to your fork:
 
-    tools/helix-fork.sh push          # pushes master, custom, all patch/pr-*
+    tools/helix-fork.sh push          # master, custom, then local patch/pr-* branches
 
-See what custom adds vs upstream:
+`master` and `custom` are pushed without force. They only ever move forward.
+
+Patch branches copy PR heads, and authors rewrite their PRs. So `push` sends
+every local `patch/pr-*` branch with `--force-with-lease`. The lease only
+overwrites what your last fetch or push saw on `origin`. If it is rejected with
+"stale info", run `git fetch origin` and push again. With no local patch
+branches, `push` prints a skip message and sends only `master` and `custom`.
+
+See your patch branches and what custom adds vs upstream:
 
     tools/helix-fork.sh status
+
+`status` lists each `patch/pr-*` branch twice if it exists in both places. A
+`local` row is a local branch. An `origin` row is the remote-tracking copy from
+your last fetch or push. Each row says whether the branch is merged into `custom`.
+Then it shows the diffstat of `custom` against `master`.
 
 ## Installing instead of Homebrew hx
 
@@ -93,11 +120,13 @@ pick a theme whose primary cursor color matches your terminal's cursor color.
 
 ## When upstream merges a patch you carry
 
-Run `sync` as usual. If upstream merged the PR, or shipped the same fix as one of
-your commits, the merge can conflict. Keep upstream's version of every conflicted
-hunk and commit the merge.
+Run `sync` as usual. If upstream's version is identical to yours, the merge is
+clean. You still delete the branch and the table row. If upstream merged the PR, or
+shipped the same fix as one of your commits, but not identically, the merge can
+conflict. Keep upstream's version of every conflicted hunk and commit the merge.
 
-Then drop the patch:
+Then drop the patch. Delete the local branch first. `push` sends every local
+`patch/pr-*` branch, so a leftover would be pushed to `origin` again.
 
     git branch -D patch/pr-<N>             # skip if there is no local branch
     git push origin --delete patch/pr-<N>
@@ -112,6 +141,7 @@ dropped patch.
 `custom` (`a6c1c6634`), so the patch branch's original commits are *not* recorded
 as ancestors of `custom`. If upstream updates #13133, `add-pr` can't detect
 it's already applied and will try to re-merge from scratch → conflicts.
+`status` shows `patch/pr-13133` as "not merged into custom" for the same reason.
 
 To refresh a squash-merged PR later:
 1. `git fetch upstream '+refs/pull/13133/head:refs/remotes/upstream/pr-13133'`
