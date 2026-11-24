@@ -72,6 +72,11 @@ pub fn get_language(name: &str) -> Result<Option<Grammar>> {
 
 #[cfg(not(target_arch = "wasm32"))]
 pub fn get_language(name: &str) -> Result<Option<Grammar>> {
+    // A name with path components would load a library from outside the runtime directories.
+    if Path::new(name).file_name() != Some(name.as_ref()) {
+        bail!("invalid grammar name {name:?}");
+    }
+
     let mut rel_library_path = PathBuf::new().join("grammars").join(name);
     rel_library_path.set_extension(DYLIB_EXTENSION);
     let library_path = crate::runtime_file(&rel_library_path);
@@ -477,6 +482,11 @@ where
 {
     let output = Command::new("git")
         .args(args)
+        // `GIT_TERMINAL_PROMPT`:
+        //      If this Boolean environment variable is set to false, git will
+        //      not prompt on the terminal (e.g., when asking for HTTP authentication).
+        // https://git-scm.com/docs/git.html#Documentation/git.txt-GITTERMINALPROMPT
+        .env("GIT_TERMINAL_PROMPT", "0")
         .current_dir(repository_dir)
         .output()?;
 

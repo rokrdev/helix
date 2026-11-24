@@ -31,7 +31,7 @@ pub use select::Select;
 pub use spinner::{ProgressSpinners, Spinner};
 pub use text::Text;
 
-use helix_view::Editor;
+use helix_view::{view::Jump, Editor};
 use tui::text::{Span, Spans};
 
 use std::path::Path;
@@ -100,8 +100,11 @@ pub fn raw_regex_prompt(
     let (view, doc) = current!(cx.editor);
     let doc_id = view.doc;
     let view_id = view.id;
-    let snapshot = doc.selection(view.id).clone();
-    let offset_snapshot = doc.view_offset(view.id);
+    // Stored as a jump so that it is mapped through edits made while the prompt is open, such
+    // as an async format. Creating a jump needs the pending changes committed.
+    doc.append_changes_to_history(view);
+    let saved_selection = Jump::new(doc, doc.selection(view.id).clone());
+    let saved_offset = doc.view_offset(view.id);
     let config = cx.editor.config();
 
     let mut prompt = Prompt::new(
@@ -109,6 +112,11 @@ pub fn raw_regex_prompt(
         history_register,
         completion_fn,
         move |cx: &mut crate::compositor::Context, input: &str, event: PromptEvent| {
+            let doc = doc!(cx.editor, &doc_id);
+            let snapshot = saved_selection.selection(doc);
+            let mut offset_snapshot = saved_offset;
+            offset_snapshot.anchor = offset_snapshot.anchor.min(doc.text().len_chars());
+
             match event {
                 PromptEvent::Abort => {
                     let doc = doc_mut!(cx.editor, &doc_id);
@@ -147,7 +155,7 @@ pub fn raw_regex_prompt(
 
                             if event == PromptEvent::Validate {
                                 // Equivalent to push_jump to store selection just before jump
-                                view.push_jump(doc, (doc_id, snapshot.clone()));
+                                view.push_jump_to(doc, snapshot.clone());
                             }
 
                             fun(cx, regex, input, event);
@@ -430,9 +438,9 @@ pub mod completers {
     use helix_view::document::SCRATCH_BUFFER_NAME;
     use helix_view::theme;
     use helix_view::{editor::Config, Editor};
-    use once_cell::sync::Lazy;
     use std::borrow::Cow;
     use std::collections::BTreeSet;
+    use std::sync::LazyLock;
     use tui::text::Span;
 
     pub type Completer = fn(&Editor, &str) -> Vec<Completion>;
@@ -512,7 +520,7 @@ pub mod completers {
     }
 
     pub fn setting(_editor: &Editor, input: &str) -> Vec<Completion> {
-        static KEYS: Lazy<Vec<String>> = Lazy::new(|| {
+        static KEYS: LazyLock<Vec<String>> = LazyLock::new(|| {
             let mut keys = Vec::new();
             let json = serde_json::json!(Config::default());
             get_keys(&json, &mut keys, None);
@@ -738,7 +746,7 @@ pub mod completers {
     }
 
     pub fn program(_editor: &Editor, input: &str) -> Vec<Completion> {
-        static PROGRAMS_IN_PATH: Lazy<BTreeSet<String>> = Lazy::new(|| {
+        static PROGRAMS_IN_PATH: LazyLock<BTreeSet<String>> = LazyLock::new(|| {
             // Go through the entire PATH and read all files into a set.
             let Some(path) = std::env::var_os("PATH") else {
                 return Default::default();

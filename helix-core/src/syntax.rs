@@ -19,8 +19,8 @@ use config::{Configuration, FileType, LanguageConfiguration, LanguageServerConfi
 use foldhash::HashSet;
 use helix_loader::grammar::get_language;
 use helix_stdx::rope::RopeSliceExt as _;
-use once_cell::sync::OnceCell;
 use ropey::RopeSlice;
+use std::sync::OnceLock;
 use tree_house::{
     highlighter,
     query_iter::QueryIter,
@@ -42,22 +42,22 @@ pub use tree_house::{
 #[derive(Debug)]
 pub struct LanguageData {
     config: Arc<LanguageConfiguration>,
-    syntax: OnceCell<Option<SyntaxConfig>>,
-    indent_query: OnceCell<Option<IndentQuery>>,
-    textobject_query: OnceCell<Option<TextObjectQuery>>,
-    tag_query: OnceCell<Option<TagQuery>>,
-    rainbow_query: OnceCell<Option<RainbowQuery>>,
+    syntax: OnceLock<Option<SyntaxConfig>>,
+    indent_query: OnceLock<Option<IndentQuery>>,
+    textobject_query: OnceLock<Option<TextObjectQuery>>,
+    tag_query: OnceLock<Option<TagQuery>>,
+    rainbow_query: OnceLock<Option<RainbowQuery>>,
 }
 
 impl LanguageData {
     fn new(config: LanguageConfiguration) -> Self {
         Self {
             config: Arc::new(config),
-            syntax: OnceCell::new(),
-            indent_query: OnceCell::new(),
-            textobject_query: OnceCell::new(),
-            tag_query: OnceCell::new(),
-            rainbow_query: OnceCell::new(),
+            syntax: OnceLock::new(),
+            indent_query: OnceLock::new(),
+            textobject_query: OnceLock::new(),
+            tag_query: OnceLock::new(),
+            rainbow_query: OnceLock::new(),
         }
     }
 
@@ -395,9 +395,9 @@ impl Loader {
         // NOTE: this is slightly different than the one for injection markers in tree-house. It
         // is anchored at the beginning.
         use helix_stdx::rope::Regex;
-        use once_cell::sync::Lazy;
+        use std::sync::LazyLock;
         const SHEBANG: &str = r"^#!\s*(?:\S*[/\\](?:env\s+(?:\-\S+\s+)*)?)?([^\s\.\d]+)";
-        static SHEBANG_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(SHEBANG).unwrap());
+        static SHEBANG_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(SHEBANG).unwrap());
 
         let marker = SHEBANG_REGEX
             .captures_iter(regex_cursor::Input::new(text))
@@ -1085,6 +1085,29 @@ impl TextObjectQuery {
         });
         Some(capture_node)
     }
+
+    /// Whether a node captured as `capture_name` covers `byte_pos`, or `None` if the query has
+    /// no such capture.
+    pub fn capture_covers(
+        &self,
+        capture_name: &str,
+        node: &Node,
+        slice: RopeSlice,
+        byte_pos: u32,
+    ) -> Option<bool> {
+        let capture = self.query.get_capture(capture_name)?;
+        let mut cursor = InactiveQueryCursor::new(byte_pos..byte_pos + 1, TREE_SITTER_MATCH_LIMIT)
+            .execute_query(&self.query, node, RopeInput::new(slice));
+        while let Some(mat) = cursor.next_match() {
+            if mat
+                .nodes_for_capture(capture)
+                .any(|node| node.byte_range().contains(&byte_pos))
+            {
+                return Some(true);
+            }
+        }
+        Some(false)
+    }
 }
 
 #[derive(Debug)]
@@ -1216,12 +1239,12 @@ impl RainbowQuery {
 
 #[cfg(test)]
 mod test {
-    use once_cell::sync::Lazy;
+    use std::sync::LazyLock;
 
     use super::*;
     use crate::{Rope, Transaction};
 
-    static LOADER: Lazy<Loader> = Lazy::new(crate::config::default_lang_loader);
+    static LOADER: LazyLock<Loader> = LazyLock::new(crate::config::default_lang_loader);
 
     #[test]
     fn test_textobject_queries() {

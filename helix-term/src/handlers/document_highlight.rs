@@ -32,10 +32,6 @@ impl AsyncHook for Handler {
         let ids = std::mem::take(&mut self.doc_ids);
         job::dispatch_blocking(move |editor, _| {
             for (doc_id, view_id) in ids {
-                // Closed views must not be re-added to the doc's selections.
-                if !editor.tree.contains(view_id) {
-                    continue;
-                }
                 request_document_highlights(editor, doc_id, view_id);
             }
         })
@@ -43,7 +39,7 @@ impl AsyncHook for Handler {
 }
 
 fn request_document_highlights(editor: &mut Editor, doc_id: DocumentId, view_id: ViewId) {
-    if !editor.config().lsp.auto_document_highlight {
+    if !editor.config().lsp.auto_document_highlight || !editor.tree.contains(view_id) {
         return;
     }
 

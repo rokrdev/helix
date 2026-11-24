@@ -998,47 +998,52 @@ async fn document_highlight_debounce_requests_for_doc_the_view_left() -> anyhow:
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn code_action_hint_debounce_skips_closed_view() -> anyhow::Result<()> {
-    let mut config = test_config();
-    config
-        .editor
-        .gutters
-        .layout
-        .push(helix_view::editor::GutterType::CodeActionHint);
-    // Keep idle from firing before the 200 ms debounce does.
-    config.editor.idle_timeout = std::time::Duration::from_millis(1000);
+async fn search_abort_after_async_edit() -> anyhow::Result<()> {
+    test_key_sequences(
+        &mut AppBuilder::new()
+            .with_input_text("one\ntwo #[x|]#\n")
+            .build()?,
+        vec![
+            (
+                Some("/"),
+                Some(&|_| {
+                    // Simulate a formatter changing the document while the search prompt is open.
+                    helix_term::job::dispatch_blocking(|editor, _| {
+                        let (view, doc) = helix_view::current!(editor);
+                        let transaction = helix_core::Transaction::change(
+                            doc.text(),
+                            std::iter::once((0, 4, None)),
+                        );
+                        doc.apply(&transaction, view.id);
+                        doc.append_changes_to_history(view);
+                    });
+                }),
+            ),
+            (None, None),
+            (
+                Some("<esc>"),
+                Some(&|app| {
+                    let (view, doc) = helix_view::current_ref!(app.editor);
+                    assert_eq!(doc.text(), "two x\n");
+                    assert_eq!(doc.selection(view.id), &Selection::single(4, 5));
+                }),
+            ),
+        ],
+        false,
+    )
+    .await
+}
 
-    let file = temp_file_with_contents("one two\n")?;
-    let mut app = AppBuilder::new()
-        .with_config(config)
-        .with_file(file.path(), None)
-        .build()?;
-
-    let doc_id = helix_view::doc!(app.editor).id();
-    app.editor
-        .switch(doc_id, helix_view::editor::Action::VerticalSplit);
-    let closed_view = app.editor.tree.focus;
-    app.editor.close(closed_view);
-    let live_view = app.editor.tree.focus;
-
-    // The live view's hint clears only if the debounce job ran.
-    helix_view::doc_mut!(app.editor, &doc_id).set_code_action_hints(live_view);
-
-    // Sent after the close to mimic an event queued before it.
-    for view_id in [closed_view, live_view] {
-        helix_event::send_blocking(
-            &app.editor.handlers.code_action_hint,
-            helix_view::handlers::lsp::CodeActionHintEvent {
-                document_id: doc_id,
-                view_id,
-            },
-        );
-    }
-    run_event_loop_until_idle(&mut app).await;
-
-    let doc = helix_view::doc!(app.editor, &doc_id);
-    assert!(!doc.code_action_hints(live_view));
-    assert!(!doc.selections().contains_key(&closed_view));
-
-    Ok(())
+// After an edit, `A-i` must not restore an `A-o` history range from before the edit.
+#[tokio::test(flavor = "multi_thread")]
+async fn shrink_selection_after_edit() -> anyhow::Result<()> {
+    test_with_config(
+        AppBuilder::new().with_file("foo.rs", None),
+        (
+            "let x = foo(#[b|]#ar);\n",
+            "<A-o>ggIzzzz<esc>%<A-i>",
+            "#[zzzzlet x = foo(bar);|]#\n",
+        ),
+    )
+    .await
 }

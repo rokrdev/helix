@@ -1,7 +1,7 @@
 use crate::{Assoc, ChangeSet, Range, Rope, Selection, Transaction};
-use once_cell::sync::Lazy;
 use regex::Regex;
 use std::num::NonZeroUsize;
+use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone)]
@@ -140,9 +140,10 @@ impl History {
             return None;
         }
 
-        let current_revision = &self.revisions[self.current];
-        self.current = current_revision.parent;
-        Some(&current_revision.inversion)
+        let previous = self.current;
+        self.current = self.revisions[previous].parent;
+        self.revisions[self.current].last_child = NonZeroUsize::new(previous);
+        Some(&self.revisions[previous].inversion)
     }
 
     /// Redo the last edit.
@@ -324,11 +325,12 @@ const TIME_UNITS: &[(&[&str], &str, u64)] = &[
 ///  * `5 min`
 ///  * `5 hr`
 ///  * `5 days`
-static DURATION_VALIDATION_REGEX: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"^(?:\d+\s*[a-z]+\s*)+$").unwrap());
+static DURATION_VALIDATION_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^(?:\d+\s*[a-z]+\s*)+$").unwrap());
 
 /// Captures both the number and unit as separate capture groups.
-static NUMBER_UNIT_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"(\d+)\s*([a-z]+)").unwrap());
+static NUMBER_UNIT_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(\d+)\s*([a-z]+)").unwrap());
 
 /// Parse a string (e.g. "5 sec") and try to convert it into a [`Duration`].
 fn parse_human_duration(s: &str) -> Result<Duration, String> {
@@ -629,5 +631,36 @@ mod test {
             "1 minute 18446744073709551615 seconds".parse::<UndoKind>(),
             Err("duration too large".to_string())
         );
+    }
+
+    #[test]
+    fn redo_after_earlier_restores_the_undone_branch() {
+        let mut history = History::default();
+        let mut state = State {
+            doc: Rope::from("a"),
+            selection: Selection::point(0),
+        };
+        fn append(history: &mut History, state: &mut State, text: &str) {
+            let end = state.doc.len_chars();
+            let txn = Transaction::change(&state.doc, [(end, end, Some(text.into()))].into_iter());
+            history.commit_revision(&txn, state);
+            txn.apply(&mut state.doc);
+        }
+        fn apply(state: &mut State, txn: Option<&Transaction>) {
+            txn.unwrap().apply(&mut state.doc);
+        }
+
+        append(&mut history, &mut state, "b");
+        append(&mut history, &mut state, "c");
+        apply(&mut state, history.undo());
+        append(&mut history, &mut state, "d");
+        for txn in history.earlier(UndoKind::Steps(1)) {
+            txn.apply(&mut state.doc);
+        }
+        assert_eq!(state.doc, "abc");
+
+        apply(&mut state, history.undo());
+        apply(&mut state, history.redo());
+        assert_eq!(state.doc, "abc");
     }
 }

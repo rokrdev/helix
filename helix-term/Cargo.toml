@@ -51,7 +51,6 @@ helix-vcs = { path = "../helix-vcs" }
 helix-loader = { path = "../helix-loader" }
 
 anyhow = "1"
-once_cell = "1.21"
 
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "io-util", "io-std", "time", "process", "macros", "fs", "parking_lot"] }
 tui = { path = "../helix-tui", package = "helix-tui", default-features = false, features = ["termina", "crossterm"] }
@@ -79,6 +78,8 @@ thiserror.workspace = true
 # opening URLs
 open = "5.3.5"
 
+same-file = "1.0.1"
+
 # config
 toml.workspace = true
 
@@ -103,4 +104,3 @@ helix-loader = { path = "../helix-loader" }
 smallvec = "1.15"
 indoc = "2.0.6"
 tempfile.workspace = true
-same-file = "1.0.1"
