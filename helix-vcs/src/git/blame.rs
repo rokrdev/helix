@@ -2,6 +2,7 @@ use anyhow::Context as _;
 use anyhow::Result;
 use helix_core::graphemes::render_grapheme;
 use parking_lot::Mutex;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -245,8 +246,15 @@ impl LineBlame {
             }
         }
 
-        // Commit text is untrusted and must not reach the terminal with control characters.
-        render_grapheme(&line_blame).into_owned()
+        // Commit text is untrusted. Keep it on one line and strip other control characters.
+        if line_blame.contains(['\n', '\r', '\t']) {
+            line_blame = line_blame.replace(['\n', '\r', '\t'], " ");
+        }
+        line_blame.truncate(line_blame.trim_end().len());
+        match render_grapheme(&line_blame) {
+            Cow::Owned(rendered) => rendered,
+            Cow::Borrowed(_) => line_blame,
+        }
     }
 }
 
@@ -636,11 +644,16 @@ mod test {
 
         assert_eq!(
             blame.clone().parse_format("{author} • {title}"),
-            "Bob\u{FFFD} • \u{FFFD}[31mred\u{FFFD}[0m\u{FFFD}title"
+            "Bob  • \u{FFFD}[31mred\u{FFFD}[0m title"
         );
+        assert_eq!(blame.clone().parse_format("{body}"), "line one line two");
         assert_eq!(
-            blame.clone().parse_format("{body}"),
-            "line one\u{FFFD}line two"
+            LineBlame {
+                commit_body: Some("body\n\n".to_owned()),
+                ..bob()
+            }
+            .parse_format("{body}"),
+            "body"
         );
     }
 }
