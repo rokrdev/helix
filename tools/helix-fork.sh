@@ -10,7 +10,7 @@
 # Workflow:
 #   tools/helix-fork.sh fetch            fetch upstream + all open PR heads
 #   tools/helix-fork.sh add-pr 1234      bring PR #1234 into custom as a clean merge
-#   tools/helix-fork.sh sync             rebase custom on latest upstream master
+#   tools/helix-fork.sh sync             ff master to upstream, merge master into custom
 #   tools/helix-fork.sh build            cargo build the custom branch
 #   tools/helix-fork.sh push             push custom + master to your fork
 #   tools/helix-fork.sh status           what your custom branch adds vs master
@@ -89,24 +89,24 @@ sync() {
   git checkout -q master || die "checkout master failed"
   git merge --ff-only "$UPSTREAM/master" \
     || die "master has diverged from $UPSTREAM/master, fix it by hand (master must only mirror upstream)"
-  echo "== rebasing custom onto master =="
-  git checkout -q "$CUSTOM"
-  git rebase master
-  # rebase each topic branch onto the new master and re-merge
-  for b in $(git for-each-ref --format='%(refname:short)' "refs/heads/$PR_PREFIX*"); do
-    local n="${b#$PR_PREFIX}"
-    echo "== re-syncing $b =="
-    git checkout -q "$b"
-    git rebase master || {
-      echo "CONFLICT rebasing $b — resolve, then run 'git rebase --continue'" >&2
+  git checkout -q "$CUSTOM" || die "checkout custom failed"
+  local sha
+  sha="$(git rev-parse --short master)"
+  if git merge-base --is-ancestor master "$CUSTOM"; then
+    echo "custom already contains master @ $sha, nothing to merge"
+  else
+    echo "== merging master @ $sha into custom =="
+    git merge --no-ff master -m "merge upstream/master ($sha) into custom" || {
+      echo "CONFLICT merging master into custom. You are still on custom, mid-merge." >&2
+      echo "Resolve the conflicted files, then run:" >&2
+      echo "  git add <files>" >&2
+      echo "  git commit" >&2
+      echo "Rule: if a conflict is because upstream now contains one of your patches," >&2
+      echo "take upstream's side, then drop that patch's patch/pr-<N> branch and table row." >&2
+      echo "To bail out instead: git merge --abort" >&2
       exit 1
     }
-    git checkout -q "$CUSTOM"
-    git merge --no-ff "$b" -m "re-merge upstream PR #$n" || {
-      echo "CONFLICT merging $b into custom — resolve manually" >&2
-      exit 1
-    }
-  done
+  fi
   git checkout -q master
   echo "custom synced. run 'tools/helix-fork.sh build' to compile."
 }
