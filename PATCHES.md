@@ -13,7 +13,8 @@ Remote: `git@github.com:rokrdev/helix.git`
     tools/helix-fork.sh   all maintenance operations
 
 The fork's `master` stays byte-identical to upstream, so `git diff master custom`
-always shows exactly what you're adding.
+shows what you're adding. It can also show upstream commits that a PR was based
+on, until the next `sync` brings `master` up to them.
 
 ## Day-to-day
 
@@ -90,6 +91,15 @@ See your patch branches and what custom adds vs upstream:
 your last fetch or push. Each row says whether the branch is merged into `custom`.
 Then it shows the diffstat of `custom` against `master`.
 
+## One-time migration of older patch branches
+
+The old script stored #3958, #16163 and #15216 as rebased copies of the PR heads.
+The first `add-pr` on each one merges the real PR head into `custom` as an "update"
+merge. That merge changes no files, because `custom` already has the same changes.
+The next `push` then moves `origin`'s `patch/pr-<N>` branch to the real PR head. It
+is a non-fast-forward move, so it goes through `--force-with-lease`. After that these
+branches behave like any other.
+
 ## Installing instead of Homebrew hx
 
 The built binary is `target/release/hx`. Symlink it onto your PATH ahead of the
@@ -156,9 +166,18 @@ it's already applied and will try to re-merge from scratch → conflicts.
 
 To refresh a squash-merged PR later:
 1. `git fetch upstream '+refs/pull/13133/head:refs/remotes/upstream/pr-13133'`
-2. Get just the delta since the version you applied (old PR tip `a828b5609`):
-   `git diff a828b5609 refs/remotes/upstream/pr-13133` — review it.
+2. Get just the delta since the version you applied. The tag `applied/pr-13133`
+   marks that old PR tip: `git diff applied/pr-13133 refs/remotes/upstream/pr-13133`.
+   Review it.
 3. Apply that delta to `custom` (`git apply`, or edit manually), build, commit.
+4. Move the tag to the tip you just applied and push it:
+   `git tag -f applied/pr-13133 refs/remotes/upstream/pr-13133` then
+   `git push --force origin applied/pr-13133`.
+
+Convention for any PR you apply as a squash: tag the PR tip you applied as
+`applied/pr-<N>` and push the tag. A bare SHA is fragile. Once the author
+force-pushes, nothing references the old tip and gc can drop it. The tag keeps it.
+`tools/helix-fork.sh push` does not send tags, so push them by hand.
 
 PRs that merge cleanly (like #3958) don't have this problem. Their commits stay
 ancestors of `custom`, so `sync` just carries them forward in the merge.
