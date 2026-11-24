@@ -9,7 +9,7 @@ Remote: `git@github.com:rokrdev/helix.git`
 
     master            mirror of upstream/master — never carries our patches
     custom            our patched branch (merges every patch/pr-<N>)
-    patch/pr-<N>      one topic branch per upstream PR, rebased onto master
+    patch/pr-<N>      one topic branch per upstream PR, rebased onto master when added
     tools/helix-fork.sh   all maintenance operations
 
 The fork's `master` stays byte-identical to upstream, so `git diff master custom`
@@ -23,11 +23,21 @@ Add a PR you want:
 
 This fetches upstream + open PR heads, recreates `patch/pr-1234` from the PR's
 current tip, rebases it onto `master`, and merges it (--no-ff) into `custom`.
-The PR author updating their branch is reflected next time you re-add or run sync.
+To pick up new commits the PR author pushed, run `add-pr` again.
 
-Pull fresh upstream and rebase everything:
+Pull fresh upstream:
 
     tools/helix-fork.sh sync
+
+This fetches upstream, fast-forwards `master`, and merges `master` into `custom`
+with a merge commit. Nothing is rebased, so history is never rewritten and `sync`
+never needs a force push. The patch branches are not touched, because they are
+already merged into `custom`.
+
+If the merge conflicts, the script stops on `custom` in the middle of the merge.
+Resolve the files, then `git add` them and run `git commit`. If the conflict is
+because upstream now contains one of your patches, take upstream's side. See
+"When upstream merges a patch you carry" below.
 
 Build the patched editor:
 
@@ -66,6 +76,7 @@ into CI or a build pipeline, say the word — it's a thin wrapper over what's he
 | patch/pr-13133  | #13133 Inline git blame                       | squash merge (a6c1c6634) |
 | patch/pr-3958   | #3958 custom names for custom commands        | --no-ff merge (d10f8209c) |
 | patch/pr-16163  | #16163 terminal block cursor                  | --no-ff merge (60640ef1f) |
+| patch/pr-15216  | #15216 call hierarchy picker                  | --no-ff merge (4c48e1b9a) |
 
 The terminal block cursor (#16163) is **opt-in** — `editor.cursor-shape` defaults
 to the software `block` cursor. To use the native terminal block cursor (fixes
@@ -80,11 +91,26 @@ Added value is `terminal-block` alongside the existing `block`, `bar`,
 `underline`, `hidden`. Note the terminal block cursor is not theme-colored;
 pick a theme whose primary cursor color matches your terminal's cursor color.
 
+## When upstream merges a patch you carry
+
+Run `sync` as usual. If upstream merged the PR, or shipped the same fix as one of
+your commits, the merge can conflict. Keep upstream's version of every conflicted
+hunk and commit the merge.
+
+Then drop the patch:
+
+    git branch -D patch/pr-<N>             # skip if there is no local branch
+    git push origin --delete patch/pr-<N>
+
+Remove its row from the "Active patches" table. Last, run `git diff master custom`.
+It should show only the patches you still carry. Delete anything left over from the
+dropped patch.
+
 ## Caveat: updating a squash-merged PR
 
 #13133 was applied as a **squash**: the feature's net tree is a single commit on
 `custom` (`a6c1c6634`), so the patch branch's original commits are *not* recorded
-as ancestors of `custom`. If upstream updates #13133, `sync`/`add-pr` can't detect
+as ancestors of `custom`. If upstream updates #13133, `add-pr` can't detect
 it's already applied and will try to re-merge from scratch → conflicts.
 
 To refresh a squash-merged PR later:
@@ -93,8 +119,8 @@ To refresh a squash-merged PR later:
    `git diff a828b5609 refs/remotes/upstream/pr-13133` — review it.
 3. Apply that delta to `custom` (`git apply`, or edit manually), build, commit.
 
-PRs that merge cleanly (like #3958) don't have this problem — they keep proper
-ancestry, so `sync` re-rebases and re-merges them automatically.
+PRs that merge cleanly (like #3958) don't have this problem. Their commits stay
+ancestors of `custom`, so `sync` just carries them forward in the merge.
 
 ## Runtime gotcha (missing syntax highlighting)
 
