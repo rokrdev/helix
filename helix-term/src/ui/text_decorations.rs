@@ -173,3 +173,181 @@ impl Decoration for Cursor<'_> {
         usize::MAX
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arc_swap::ArcSwap;
+    use helix_core::{
+        config::default_lang_loader,
+        diagnostic::{Diagnostic, DiagnosticProvider, LanguageServerId, Range, Severity},
+        doc_formatter::TextFormat,
+        text_annotations::{InlineAnnotation, TextAnnotations},
+        Rope,
+    };
+    use helix_view::{
+        annotations::diagnostics::{DiagnosticFilter, InlineDiagnosticsConfig},
+        editor::{Config, GutterConfig},
+        graphics::Rect,
+        Document, DocumentId, Theme, View,
+    };
+    use tui::buffer::Buffer as Surface;
+
+    use super::*;
+    use crate::ui::document::render_text;
+
+    fn doc(text: &str) -> Document {
+        Document::from(
+            Rope::from(text),
+            None,
+            Arc::new(ArcSwap::new(Arc::new(Config::default()))),
+            Arc::new(ArcSwap::new(Arc::new(default_lang_loader()))),
+        )
+    }
+
+    fn wrap_format(viewport: Rect) -> TextFormat {
+        TextFormat {
+            soft_wrap: true,
+            viewport_width: viewport.width,
+            wrap_indicator: "↩".into(),
+            ..Default::default()
+        }
+    }
+
+    fn render(
+        doc: &Document,
+        text_fmt: &TextFormat,
+        annotations: &TextAnnotations,
+        viewport: Rect,
+        decorations: DecorationManager,
+    ) -> Surface {
+        let theme: Theme = toml::from_str("").unwrap();
+        let mut surface = Surface::empty(viewport);
+        let mut renderer =
+            TextRenderer::new(&mut surface, doc, &theme, Position::new(0, 0), viewport);
+        render_text(
+            &mut renderer,
+            doc.text().slice(..),
+            0,
+            text_fmt,
+            annotations,
+            None,
+            Vec::new(),
+            &theme,
+            decorations,
+        );
+        surface
+    }
+
+    fn diagnostic_connector(
+        mut doc: Document,
+        start: usize,
+        text_fmt: &TextFormat,
+        annotations: &TextAnnotations,
+        viewport: Rect,
+    ) -> Option<(u16, u16)> {
+        let end = doc.text().len_chars();
+        doc.replace_diagnostics(
+            [Diagnostic {
+                range: Range { start, end },
+                ends_at_word: false,
+                starts_at_word: false,
+                zero_width: false,
+                line: 0,
+                message: "msg".into(),
+                severity: Some(Severity::Warning),
+                code: None,
+                provider: DiagnosticProvider::Lsp {
+                    server_id: LanguageServerId::default(),
+                    identifier: None,
+                },
+                tags: Vec::new(),
+                source: None,
+                data: None,
+            }],
+            &[],
+            None,
+        );
+        let config = InlineDiagnosticsConfig {
+            cursor_line: DiagnosticFilter::Enable(Severity::Hint),
+            other_lines: DiagnosticFilter::Enable(Severity::Hint),
+            min_diagnostic_width: 1,
+            prefix_len: 1,
+            max_wrap: 20,
+            max_diagnostics: 10,
+        };
+        let theme: Theme = toml::from_str("").unwrap();
+        let mut decorations = DecorationManager::default();
+        decorations.add_decoration(InlineDiagnostics::new(
+            &doc,
+            &theme,
+            0,
+            config,
+            DiagnosticFilter::Disable,
+        ));
+        let surface = render(&doc, text_fmt, annotations, viewport, decorations);
+
+        (viewport.y..viewport.bottom())
+            .flat_map(|y| (viewport.x..viewport.right()).map(move |x| (x, y)))
+            .find(|&(x, y)| {
+                surface
+                    .get(x, y)
+                    .is_some_and(|cell| cell.symbol.as_str() == "└")
+            })
+    }
+
+    #[test]
+    fn cursor_lands_on_char_after_wrap_indicator() {
+        let doc = doc("aaaa bbbb cccc dddd");
+        let viewport = Rect::new(0, 0, 10, 4);
+        let cache = CursorCache::default();
+        let mut decorations = DecorationManager::default();
+        // char 10 is the 'c' that starts the first wrapped row
+        decorations.add_decoration(Cursor {
+            cache: &cache,
+            primary_cursor: 10,
+        });
+        render(
+            &doc,
+            &wrap_format(viewport),
+            &TextAnnotations::default(),
+            viewport,
+            decorations,
+        );
+
+        let view = View::new(DocumentId::default(), GutterConfig::default());
+        assert_eq!(cache.get(&view, &doc), Some(Position::new(1, 1)));
+    }
+
+    #[test]
+    fn diagnostic_anchors_on_char_after_wrap_indicator() {
+        let viewport = Rect::new(0, 0, 10, 6);
+        // char 10 is the 'c' at col 1 of the wrapped row, after the indicator at col 0
+        let connector = diagnostic_connector(
+            doc("aaaa bbbb cccc"),
+            10,
+            &wrap_format(viewport),
+            &TextAnnotations::default(),
+            viewport,
+        );
+        assert_eq!(connector, Some((1, 2)));
+    }
+
+    #[test]
+    fn diagnostic_anchors_on_char_after_inlay_hint() {
+        let viewport = Rect::new(0, 0, 20, 4);
+        let hints = [InlineAnnotation::new(3, "XY: ")];
+        let mut annotations = TextAnnotations::default();
+        annotations.add_inline_annotations(&hints, None);
+        // the hint takes cols 3 to 6, so the 'c' at char 3 sits at col 7
+        let connector = diagnostic_connector(
+            doc("ab cd"),
+            3,
+            &TextFormat::default(),
+            &annotations,
+            viewport,
+        );
+        assert_eq!(connector, Some((7, 1)));
+    }
+}

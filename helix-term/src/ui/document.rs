@@ -162,7 +162,10 @@ pub fn render_text(
                 overlay_style: overlay_highlighter.style,
             }
         };
-        decorations.decorate_grapheme(renderer, &grapheme);
+        // Virtual text reuses the next real grapheme's char_idx, so anchors must skip it.
+        if !grapheme.is_virtual() {
+            decorations.decorate_grapheme(renderer, &grapheme);
+        }
 
         let virt = grapheme.is_virtual();
         let grapheme_width = renderer.draw_grapheme(
